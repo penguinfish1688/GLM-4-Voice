@@ -72,6 +72,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.8)
     parser.add_argument("--max-new-tokens", type=int, default=2000)
     parser.add_argument(
+        "--hidden-retries",
+        type=int,
+        default=3,
+        help="Retry count for hidden/steering generation when no audio tokens are returned",
+    )
+    parser.add_argument(
         "--system-prompt",
         default=(
             "User will provide you with a speech instruction. Do it step by step. "
@@ -172,52 +178,68 @@ def generate_audio(
 
     # Hidden or steering path: do one generation and decode audio from the same token_ids.
     if return_hidden or steering_map is not None:
-        if steering_map is not None:
-            if inject_layer is None:
-                raise RuntimeError("inject_layer is required when steering_map is provided")
-            response = requests.post(
-                args.server_steering_url,
-                json={
-                    "prompt": inputs,
-                    "temperature": args.temperature,
-                    "top_p": args.top_p,
-                    "max_new_tokens": args.max_new_tokens,
-                    "inject_layer": int(inject_layer),
-                    "steering_map": steering_map,
-                    "return_hidden": bool(return_hidden),
-                },
-                timeout=600,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if int(payload.get("error_code", 1)) != 0:
-                raise RuntimeError(f"generate_with_steering failed: {payload}")
-        else:
-            response = requests.post(
-                args.server_hidden_url,
-                json={
-                    "prompt": inputs,
-                    "temperature": args.temperature,
-                    "top_p": args.top_p,
-                    "max_new_tokens": args.max_new_tokens,
-                },
-                timeout=600,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if int(payload.get("error_code", 1)) != 0:
-                raise RuntimeError(f"generate_with_hidden failed: {payload}")
+        retries = max(1, int(getattr(args, "hidden_retries", 1)))
+        last_exc: Exception | None = None
+        for attempt in range(1, retries + 1):
+            if steering_map is not None:
+                if inject_layer is None:
+                    raise RuntimeError("inject_layer is required when steering_map is provided")
+                response = requests.post(
+                    args.server_steering_url,
+                    json={
+                        "prompt": inputs,
+                        "temperature": args.temperature,
+                        "top_p": args.top_p,
+                        "max_new_tokens": args.max_new_tokens,
+                        "inject_layer": int(inject_layer),
+                        "steering_map": steering_map,
+                        "return_hidden": bool(return_hidden),
+                    },
+                    timeout=600,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if int(payload.get("error_code", 1)) != 0:
+                    raise RuntimeError(f"generate_with_steering failed: {payload}")
+            else:
+                response = requests.post(
+                    args.server_hidden_url,
+                    json={
+                        "prompt": inputs,
+                        "temperature": args.temperature,
+                        "top_p": args.top_p,
+                        "max_new_tokens": args.max_new_tokens,
+                    },
+                    timeout=600,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if int(payload.get("error_code", 1)) != 0:
+                    raise RuntimeError(f"generate_with_hidden failed: {payload}")
 
-        token_ids = payload.get("token_ids", [])
-        if not isinstance(token_ids, list):
-            raise RuntimeError("Invalid response: token_ids is not a list")
+            token_ids = payload.get("token_ids", [])
+            if not isinstance(token_ids, list):
+                raise RuntimeError("Invalid response: token_ids is not a list")
 
-        hidden_states: torch.Tensor | None = None
-        if return_hidden:
-            hidden_states = _decode_hidden_from_payload(payload)
+            hidden_states: torch.Tensor | None = None
+            if return_hidden:
+                hidden_states = _decode_hidden_from_payload(payload)
 
-        tts_speech = decode_audio_from_token_ids([int(x) for x in token_ids], glm_tokenizer, audio_decoder, args.device)
-        return tts_speech, [int(x) for x in token_ids], hidden_states
+            try:
+                tts_speech = decode_audio_from_token_ids([int(x) for x in token_ids], glm_tokenizer, audio_decoder, args.device)
+                return tts_speech, [int(x) for x in token_ids], hidden_states
+            except RuntimeError as ex:
+                if "No audio tokens returned from model" not in str(ex):
+                    raise
+                last_exc = ex
+                if attempt < retries:
+                    print(f"[WARN] hidden generation produced no audio tokens (attempt {attempt}/{retries}), retrying...")
+                    continue
+                raise RuntimeError(f"No audio tokens returned from model after {retries} attempts") from ex
+
+        if last_exc is not None:
+            raise RuntimeError(f"No audio tokens returned from model after {retries} attempts") from last_exc
+        raise RuntimeError("Hidden generation failed unexpectedly")
 
     with torch.no_grad():
         response = requests.post(
@@ -282,7 +304,7 @@ def generate_audio(
         if not tts_speechs:
             raise RuntimeError("Model returned no audio tokens for this sample")
 
-            return torch.cat(tts_speechs, dim=-1).cpu(), [], None
+        return torch.cat(tts_speechs, dim=-1).cpu(), [], None
 
     raise RuntimeError("Unreachable: generate_audio did not return")
 
