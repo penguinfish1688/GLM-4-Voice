@@ -32,6 +32,9 @@ from speech_tokenizer.modeling_whisper import WhisperVQEncoder
 from speech_tokenizer.utils import extract_speech_token
 
 
+AUDIO_TOKEN_RE = re.compile(r"<\|audio_(\d+)\|>")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("glm4voice_rootdir_inference")
     parser.add_argument("--root-dir", required=True, help="Dataset root containing */input.wav")
@@ -315,15 +318,14 @@ def decode_audio_from_token_ids(
     audio_decoder: AudioDecoder,
     device: str,
 ) -> torch.Tensor:
-    audio_offset = int(glm_tokenizer.convert_tokens_to_ids("<|audio_0|>"))
-    end_token_id = int(glm_tokenizer.convert_tokens_to_ids("<|user|>"))
-
     audio_tokens: List[int] = []
-    for token_id in token_ids:
-        if token_id == end_token_id:
+    token_names = glm_tokenizer.convert_ids_to_tokens(token_ids)
+    for tok in token_names:
+        if tok == "<|user|>":
             break
-        if token_id >= audio_offset:
-            audio_tokens.append(int(token_id - audio_offset))
+        m = AUDIO_TOKEN_RE.fullmatch(str(tok))
+        if m is not None:
+            audio_tokens.append(int(m.group(1)))
 
     if not audio_tokens:
         raise RuntimeError("No audio tokens returned from model")
@@ -333,26 +335,24 @@ def decode_audio_from_token_ids(
 
 
 def count_audio_tokens(token_ids: List[int], glm_tokenizer: Any) -> int:
-    audio_offset = int(glm_tokenizer.convert_tokens_to_ids("<|audio_0|>"))
-    end_token_id = int(glm_tokenizer.convert_tokens_to_ids("<|user|>"))
     n = 0
-    for token_id in token_ids:
-        if token_id == end_token_id:
+    token_names = glm_tokenizer.convert_ids_to_tokens(token_ids)
+    for tok in token_names:
+        if tok == "<|user|>":
             break
-        if token_id >= audio_offset:
+        if AUDIO_TOKEN_RE.fullmatch(str(tok)) is not None:
             n += 1
     return int(n)
 
 
 def build_audio_token_mask(token_ids: List[int], glm_tokenizer: Any) -> List[bool]:
-    audio_offset = int(glm_tokenizer.convert_tokens_to_ids("<|audio_0|>"))
-    end_token_id = int(glm_tokenizer.convert_tokens_to_ids("<|user|>"))
+    token_names = glm_tokenizer.convert_ids_to_tokens(token_ids)
     mask: List[bool] = []
-    for token_id in token_ids:
-        if token_id == end_token_id:
+    for tok in token_names:
+        if tok == "<|user|>":
             mask.append(False)
             break
-        mask.append(bool(token_id >= audio_offset))
+        mask.append(AUDIO_TOKEN_RE.fullmatch(str(tok)) is not None)
     # Keep shape aligned with token_ids if no explicit stop token appears.
     if len(mask) < len(token_ids):
         mask.extend([False] * (len(token_ids) - len(mask)))
