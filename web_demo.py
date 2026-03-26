@@ -260,6 +260,8 @@ if __name__ == "__main__":
         input_mode.input(clear_fn, outputs=[chatbot, history_state, input_tokens, completion_tokens, detailed_error, output_audio, complete_audio]).then(update_input_interface, inputs=[input_mode], outputs=[audio, text_input])
 
     initialize_fn()
+    # Generator-based streaming requires Gradio queue.
+    demo.queue()
     # Launch the interface
     demo.launch(
         server_port=args.port,

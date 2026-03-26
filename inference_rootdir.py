@@ -129,7 +129,7 @@ def parse_args() -> argparse.Namespace:
         default="http://localhost:10000/generate_with_steering",
         help="Model server steering endpoint",
     )
-    parser.add_argument("--request-timeout", type=float, default=600.0, help="HTTP timeout for server requests")
+    parser.add_argument("--request-timeout", type=float, default=180.0, help="HTTP timeout for server requests")
 
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.8)
@@ -138,12 +138,6 @@ def parse_args() -> argparse.Namespace:
         "--oom-retry-scales",
         default="0.75,0.5,0.35",
         help="Comma-separated scales to retry max_new_tokens after CUDA OOM (example: 0.75,0.5)",
-    )
-    parser.add_argument(
-        "--hidden-retries",
-        type=int,
-        default=3,
-        help="Retry count for hidden/steering generation when no audio tokens are returned",
     )
     parser.add_argument(
         "--system-prompt",
