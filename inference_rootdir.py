@@ -227,18 +227,32 @@ def generate_tokens_and_hidden(prompt: str, args: argparse.Namespace) -> tuple[L
     if not isinstance(token_ids, list):
         raise RuntimeError("Invalid response: token_ids is not a list")
 
-    hidden_shape = payload.get("hidden_shape", [0, 0])
-    if not isinstance(hidden_shape, list) or len(hidden_shape) != 2:
-        raise RuntimeError("Invalid response: hidden_shape")
+    hidden_layers_shape = payload.get("hidden_layers_shape", None)
+    hidden_layers_b64 = payload.get("hidden_layers_b64", "")
 
-    hidden_b64 = payload.get("hidden_b64", "")
-    raw = base64.b64decode(hidden_b64) if hidden_b64 else b""
-
-    if hidden_shape[0] == 0:
-        hidden_states = torch.empty((0, 0), dtype=torch.float16)
+    if isinstance(hidden_layers_shape, list) and len(hidden_layers_shape) == 3:
+        raw = base64.b64decode(hidden_layers_b64) if hidden_layers_b64 else b""
+        if hidden_layers_shape[0] == 0:
+            hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
+        else:
+            hidden_states = (
+                torch.frombuffer(raw, dtype=torch.float16)
+                .clone()
+                .reshape(hidden_layers_shape[0], hidden_layers_shape[1], hidden_layers_shape[2])
+            )
     else:
-        hidden_np = torch.frombuffer(raw, dtype=torch.float16).clone().reshape(hidden_shape[0], hidden_shape[1])
-        hidden_states = hidden_np
+        # Backward compatibility for older server payloads that only return last-layer hidden.
+        hidden_shape = payload.get("hidden_shape", [0, 0])
+        if not isinstance(hidden_shape, list) or len(hidden_shape) != 2:
+            raise RuntimeError("Invalid response: hidden_shape/hidden_layers_shape")
+
+        hidden_b64 = payload.get("hidden_b64", "")
+        raw = base64.b64decode(hidden_b64) if hidden_b64 else b""
+        if hidden_shape[0] == 0:
+            hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
+        else:
+            hidden_2d = torch.frombuffer(raw, dtype=torch.float16).clone().reshape(hidden_shape[0], hidden_shape[1])
+            hidden_states = hidden_2d.unsqueeze(1)
 
     return [int(x) for x in token_ids], hidden_states
 
@@ -279,10 +293,22 @@ def save_hidden_payload(
     if out_token_ids.shape[0] > 1:
         in_token_ids[1:, 0] = out_token_ids[:-1, 0]
 
-    t = int(hidden_states.shape[0])
+    if hidden_states.dim() == 2:
+        text_hidden_layers = hidden_states.unsqueeze(1)
+    elif hidden_states.dim() == 3:
+        text_hidden_layers = hidden_states
+    else:
+        raise RuntimeError(f"Expected hidden_states with dim 2 or 3, got {hidden_states.dim()}")
+
+    t = int(text_hidden_layers.shape[0])
     frame_rate_hz = 12.5
     times = torch.arange(t, dtype=torch.float32) / frame_rate_hz
     token_time_ranges = torch.stack([times, times + (1.0 / frame_rate_hz)], dim=1) if t > 0 else torch.empty((0, 2))
+
+    if text_hidden_layers.shape[1] > 0:
+        last_hidden = text_hidden_layers[:, -1, :]
+    else:
+        last_hidden = torch.empty((t, 0), dtype=text_hidden_layers.dtype)
 
     payload = {
         "schema_version": 1,
@@ -297,8 +323,9 @@ def save_hidden_payload(
         "output_token_width": 1,
         "times": times,
         "token_time_ranges_sec": token_time_ranges,
-        "hidden_states": hidden_states.float().cpu(),
-        "text_hidden_layers": hidden_states.float().cpu().unsqueeze(1),
+        # Keep legacy key as last-layer hidden for downstream compatibility.
+        "hidden_states": last_hidden.float().cpu(),
+        "text_hidden_layers": text_hidden_layers.float().cpu(),
     }
     torch.save(payload, hidden_path)
 
@@ -356,17 +383,31 @@ def generate_tokens_with_steering(
 
     hidden_states: torch.Tensor | None = None
     if args.save_hidden:
-        hidden_shape = payload.get("hidden_shape", [0, 0])
-        if not isinstance(hidden_shape, list) or len(hidden_shape) != 2:
-            raise RuntimeError("Invalid response: hidden_shape")
+        hidden_layers_shape = payload.get("hidden_layers_shape", None)
+        hidden_layers_b64 = payload.get("hidden_layers_b64", "")
 
-        hidden_b64 = payload.get("hidden_b64", "")
-        raw = base64.b64decode(hidden_b64) if hidden_b64 else b""
-
-        if hidden_shape[0] == 0:
-            hidden_states = torch.empty((0, 0), dtype=torch.float16)
+        if isinstance(hidden_layers_shape, list) and len(hidden_layers_shape) == 3:
+            raw = base64.b64decode(hidden_layers_b64) if hidden_layers_b64 else b""
+            if hidden_layers_shape[0] == 0:
+                hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
+            else:
+                hidden_states = (
+                    torch.frombuffer(raw, dtype=torch.float16)
+                    .clone()
+                    .reshape(hidden_layers_shape[0], hidden_layers_shape[1], hidden_layers_shape[2])
+                )
         else:
-            hidden_states = torch.frombuffer(raw, dtype=torch.float16).clone().reshape(hidden_shape[0], hidden_shape[1])
+            hidden_shape = payload.get("hidden_shape", [0, 0])
+            if not isinstance(hidden_shape, list) or len(hidden_shape) != 2:
+                raise RuntimeError("Invalid response: hidden_shape/hidden_layers_shape")
+
+            hidden_b64 = payload.get("hidden_b64", "")
+            raw = base64.b64decode(hidden_b64) if hidden_b64 else b""
+            if hidden_shape[0] == 0:
+                hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
+            else:
+                hidden_2d = torch.frombuffer(raw, dtype=torch.float16).clone().reshape(hidden_shape[0], hidden_shape[1])
+                hidden_states = hidden_2d.unsqueeze(1)
 
     return [int(x) for x in token_ids], hidden_states
 

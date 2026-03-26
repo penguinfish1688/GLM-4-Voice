@@ -120,6 +120,32 @@ class ModelWorker:
             return model.layers
         raise RuntimeError("Unable to locate transformer layers on this model")
 
+    @staticmethod
+    def _pack_generated_hidden_layers(hidden_states: Any, prompt_len: int) -> dict[str, Any]:
+        if not isinstance(hidden_states, (tuple, list)) or len(hidden_states) == 0:
+            raise RuntimeError("Model did not return hidden_states")
+
+        # HF hidden_states usually includes embedding output at index 0.
+        layer_states = list(hidden_states[1:]) if len(hidden_states) > 1 else list(hidden_states)
+        per_layer = [h[0, prompt_len:, :] for h in layer_states]
+        if len(per_layer) == 0:
+            hidden_layers = torch.empty((0, 0, 0), dtype=torch.float16)
+        else:
+            hidden_layers = torch.stack(per_layer, dim=1).detach().cpu().to(torch.float16)
+
+        last_hidden = hidden_layers[:, -1, :] if hidden_layers.shape[1] > 0 else torch.empty((0, 0), dtype=torch.float16)
+        hidden_layers_np = hidden_layers.numpy()
+        last_hidden_np = last_hidden.numpy()
+
+        return {
+            "hidden_dtype": "float16",
+            "hidden_layers_shape": list(hidden_layers_np.shape),
+            "hidden_layers_b64": base64.b64encode(hidden_layers_np.tobytes()).decode("ascii"),
+            # Backward-compatible single-layer fields.
+            "hidden_shape": list(last_hidden_np.shape),
+            "hidden_b64": base64.b64encode(last_hidden_np.tobytes()).decode("ascii"),
+        }
+
     @torch.inference_mode()
     def generate_stream(self, params):
         tokenizer, model = self.glm_tokenizer, self.glm_model
@@ -190,14 +216,11 @@ class ModelWorker:
             output_hidden_states=True,
             return_dict=True,
         )
-        last_hidden = forward_out.hidden_states[-1][0, prompt_len:, :]
-        hidden_np = last_hidden.detach().cpu().to(torch.float16).numpy()
+        hidden_payload = self._pack_generated_hidden_layers(forward_out.hidden_states, prompt_len)
 
         return {
             "token_ids": generated_ids.detach().cpu().tolist(),
-            "hidden_dtype": "float16",
-            "hidden_shape": list(hidden_np.shape),
-            "hidden_b64": base64.b64encode(hidden_np.tobytes()).decode("ascii"),
+            **hidden_payload,
             "error_code": 0,
         }
 
@@ -209,6 +232,8 @@ class ModelWorker:
             return {
                 "token_ids": [],
                 "hidden_dtype": "float16",
+                "hidden_layers_shape": [0, 0, 0],
+                "hidden_layers_b64": "",
                 "hidden_shape": [0, 0],
                 "hidden_b64": "",
                 "error_code": 1,
@@ -355,16 +380,7 @@ class ModelWorker:
                 )
             finally:
                 cap_handle.remove()
-
-            last_hidden = forward_out.hidden_states[-1][0, prompt_len:, :]
-            hidden_np = last_hidden.detach().cpu().to(torch.float16).numpy()
-            payload.update(
-                {
-                    "hidden_dtype": "float16",
-                    "hidden_shape": list(hidden_np.shape),
-                    "hidden_b64": base64.b64encode(hidden_np.tobytes()).decode("ascii"),
-                }
-            )
+            payload.update(self._pack_generated_hidden_layers(forward_out.hidden_states, prompt_len))
 
         return payload
 
