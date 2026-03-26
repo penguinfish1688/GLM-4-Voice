@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from transformers import AutoModel
 
 
@@ -50,27 +51,80 @@ def _to_token_ids(raw) -> torch.Tensor:
     return ids
 
 
-def _get_lm_head_and_norm(model):
-    lm_head = None
+def _resolve_lm_head(model):
+    # 1) Standard HF API
     if hasattr(model, "get_output_embeddings"):
-        lm_head = model.get_output_embeddings()
-    if lm_head is None:
-        lm_head = getattr(model, "lm_head", None) or getattr(model, "output_layer", None)
-    if lm_head is None:
-        raise RuntimeError("Cannot find output embedding/lm head in model")
+        try:
+            emb = model.get_output_embeddings()
+            if emb is not None:
+                return emb, "get_output_embeddings"
+        except Exception:
+            pass
+
+    # 2) Common attribute names across custom GLM wrappers
+    attr_candidates = [
+        "lm_head",
+        "output_layer",
+        "text_linear",
+        "embed_out",
+    ]
+    nested_candidates = [
+        ("transformer", "output_layer"),
+        ("transformer", "lm_head"),
+        ("model", "lm_head"),
+        ("language_model", "lm_head"),
+    ]
+    for name in attr_candidates:
+        head = getattr(model, name, None)
+        if head is not None:
+            return head, name
+    for parent_name, child_name in nested_candidates:
+        parent = getattr(model, parent_name, None)
+        if parent is not None:
+            head = getattr(parent, child_name, None)
+            if head is not None:
+                return head, f"{parent_name}.{child_name}"
+
+    # 3) Heuristic: pick the Linear with largest out_features (typically vocab head)
+    best_name = None
+    best_mod = None
+    best_vocab = -1
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear) and mod.out_features > best_vocab:
+            best_vocab = int(mod.out_features)
+            best_name = name
+            best_mod = mod
+    if best_mod is not None and best_vocab > 1000:
+        return best_mod, f"heuristic:{best_name}"
+
+    # 4) Fallback: tied input embedding projection
+    if hasattr(model, "get_input_embeddings"):
+        try:
+            in_emb = model.get_input_embeddings()
+            if in_emb is not None and hasattr(in_emb, "weight"):
+                return in_emb, "tied_input_embeddings"
+        except Exception:
+            pass
+
+    raise RuntimeError("Cannot resolve output projection head for this model")
+
+
+def _get_lm_head_and_norm(model):
+    lm_head, head_name = _resolve_lm_head(model)
 
     norm = None
     candidates = [
         ("transformer", "final_layernorm"),
         ("transformer", "output_layernorm"),
         ("model", "norm"),
+        ("transformer", "norm"),
     ]
     for parent_name, attr_name in candidates:
         parent = getattr(model, parent_name, None)
         if parent is not None and hasattr(parent, attr_name):
             norm = getattr(parent, attr_name)
             break
-    return lm_head, norm
+    return lm_head, norm, head_name
 
 
 def _project_logits(hidden: torch.Tensor, lm_head, norm_layer, device: str) -> torch.Tensor:
@@ -78,7 +132,14 @@ def _project_logits(hidden: torch.Tensor, lm_head, norm_layer, device: str) -> t
     if norm_layer is not None:
         x = norm_layer(x)
     with torch.no_grad():
-        logits = lm_head(x).float()
+        # Module-style output head.
+        if callable(lm_head):
+            logits = lm_head(x).float()
+        # Embedding fallback (tied weights): logits = x @ W^T
+        elif hasattr(lm_head, "weight"):
+            logits = F.linear(x, lm_head.weight).float()
+        else:
+            raise RuntimeError("Unsupported lm head type for projection")
     return logits
 
 
@@ -258,7 +319,8 @@ def main() -> None:
 
     print("[INIT] loading GLM model for CE plotting...")
     model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True, device_map={"": 0}).eval()
-    lm_head, norm_layer = _get_lm_head_and_norm(model)
+    lm_head, norm_layer, head_name = _get_lm_head_and_norm(model)
+    print(f"[INIT] using output head: {head_name}")
 
     ok = 0
     total = 0
