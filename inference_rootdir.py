@@ -497,10 +497,11 @@ def main() -> None:
                     hidden_states=hidden_states,
                     glm_tokenizer=glm_tokenizer,
                 )
+                hs = tuple(int(x) for x in hidden_states.shape)
                 if args.inference_with_steering:
-                    print(f"[OK] {output_path} + {hidden_path} (steered layer={int(args.inject_layer)})")
+                    print(f"[OK] {output_path} + {hidden_path} hidden_shape={hs} (steered layer={int(args.inject_layer)})")
                 else:
-                    print(f"[OK] {output_path} + {hidden_path}")
+                    print(f"[OK] {output_path} + {hidden_path} hidden_shape={hs}")
             else:
                 if args.inference_with_steering:
                     print(f"[OK] {output_path} (steered layer={int(args.inject_layer)})")

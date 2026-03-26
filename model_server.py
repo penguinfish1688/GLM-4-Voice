@@ -14,6 +14,7 @@ import argparse
 import json
 import base64
 from typing import Any
+import torch.nn as nn
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -105,17 +106,60 @@ class ModelWorker:
 
     @staticmethod
     def _get_transformer_layers(model: Any):
-        candidates = [
+        # Common explicit paths first.
+        explicit_paths = [
             ("transformer", "layers"),
             ("model", "layers"),
             ("encoder", "layers"),
+            ("decoder", "layers"),
+            ("transformer", "encoder", "layers"),
+            ("model", "encoder", "layers"),
+            ("transformer", "h"),
+            ("model", "h"),
         ]
-        for parent_name, child_name in candidates:
-            parent = getattr(model, parent_name, None)
-            if parent is not None and hasattr(parent, child_name):
-                layers = getattr(parent, child_name)
-                if hasattr(layers, "__len__"):
-                    return layers
+
+        def _get_path(root: Any, path: tuple[str, ...]):
+            cur = root
+            for p in path:
+                cur = getattr(cur, p, None)
+                if cur is None:
+                    return None
+            return cur
+
+        best = None
+        best_len = -1
+
+        for path in explicit_paths:
+            layers = _get_path(model, path)
+            if layers is None or not hasattr(layers, "__len__"):
+                continue
+            n = int(len(layers))
+            if n > best_len:
+                best = layers
+                best_len = n
+
+        # Fallback heuristic: choose the largest ModuleList that looks like transformer blocks.
+        for _name, module in model.named_modules():
+            if not isinstance(module, nn.ModuleList):
+                continue
+            n = int(len(module))
+            if n <= best_len:
+                continue
+            if n == 0:
+                continue
+            first = module[0]
+            attrs = set(dir(first))
+            looks_like_block = any(
+                k in attrs
+                for k in ["self_attn", "attention", "mlp", "feed_forward", "input_layernorm", "post_attention_layernorm"]
+            )
+            if looks_like_block or n >= 8:
+                best = module
+                best_len = n
+
+        if best is not None:
+            return best
+
         if hasattr(model, "layers") and hasattr(model.layers, "__len__"):
             return model.layers
         raise RuntimeError("Unable to locate transformer layers on this model")
@@ -200,6 +244,37 @@ class ModelWorker:
             "hidden_b64": base64.b64encode(last_hidden_np.tobytes()).decode("ascii"),
         }
 
+    @staticmethod
+    def _register_layer_capture_hooks(layers):
+        latest: list[torch.Tensor | None] = [None] * len(layers)
+        handles = []
+
+        def _mk_hook(idx: int):
+            def _hook(_module, _inputs, output):
+                hidden = output[0] if isinstance(output, tuple) else output
+                if isinstance(hidden, torch.Tensor) and hidden.dim() == 3:
+                    latest[idx] = hidden
+                return output
+
+            return _hook
+
+        for idx, layer in enumerate(layers):
+            handles.append(layer.register_forward_hook(_mk_hook(idx)))
+
+        return latest, handles
+
+    @staticmethod
+    def _collect_step_layer_hidden(latest: list[torch.Tensor | None]) -> torch.Tensor | None:
+        step_layers: list[torch.Tensor] = []
+        for hidden in latest:
+            if hidden is None or hidden.dim() != 3:
+                return None
+            step_layers.append(hidden[0, -1, :].detach())
+
+        if not step_layers:
+            return None
+        return torch.stack(step_layers, dim=0)
+
     @torch.inference_mode()
     def generate_stream(self, params):
         tokenizer, model = self.glm_tokenizer, self.glm_model
@@ -248,28 +323,66 @@ class ModelWorker:
         top_p = float(params.get("top_p", 1.0))
         max_new_tokens = int(params.get("max_new_tokens", 256))
 
-        inputs = tokenizer([prompt], return_tensors="pt")
-        inputs = inputs.to(self.device)
-        prompt_len = int(inputs["input_ids"].shape[1])
+        inputs = tokenizer([prompt], return_tensors="pt").to(self.device)
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs.get("attention_mask", None)
 
-        output = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=True,
-            return_dict_in_generate=True,
-        )
+        layers = self._get_transformer_layers(model)
+        latest_hidden, cap_handles = self._register_layer_capture_hooks(layers)
 
-        sequences = output.sequences
-        full_ids = sequences[0]
-        generated_ids = full_ids[prompt_len:]
+        generated: list[int] = []
+        step_hidden: list[torch.Tensor] = []
+        past_key_values = None
+        stop_token_id = tokenizer.convert_tokens_to_ids("<|user|>")
 
-        hidden_layers = self._capture_all_layer_hidden(model, sequences, prompt_len)
+        try:
+            cur_input_ids = input_ids
+            cur_attention_mask = attention_mask
+
+            for _step in range(max_new_tokens):
+                outputs = model(
+                    input_ids=cur_input_ids,
+                    attention_mask=cur_attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+
+                step_h = self._collect_step_layer_hidden(latest_hidden)
+                if step_h is not None:
+                    step_hidden.append(step_h)
+
+                logits = outputs.logits[:, -1, :]
+                next_token = self._sample_top_p(logits, temperature=temperature, top_p=top_p)
+                token_id = int(next_token.item())
+                generated.append(token_id)
+
+                if token_id == stop_token_id:
+                    break
+
+                past_key_values = outputs.past_key_values
+                cur_input_ids = next_token.unsqueeze(0)
+                if cur_attention_mask is not None:
+                    cur_attention_mask = torch.cat(
+                        [
+                            cur_attention_mask,
+                            torch.ones((1, 1), device=cur_attention_mask.device, dtype=cur_attention_mask.dtype),
+                        ],
+                        dim=1,
+                    )
+        finally:
+            for h in cap_handles:
+                h.remove()
+
+        if step_hidden:
+            hidden_layers = torch.stack(step_hidden, dim=0).to(torch.float16).cpu()
+        else:
+            hidden_layers = torch.empty((0, int(len(layers)), int(getattr(model.config, "hidden_size", 0))), dtype=torch.float16)
+
         hidden_payload = self._pack_hidden_layers_tensor(hidden_layers)
 
         return {
-            "token_ids": generated_ids.detach().cpu().tolist(),
+            "token_ids": generated,
             **hidden_payload,
             "error_code": 0,
         }
@@ -351,8 +464,13 @@ class ModelWorker:
             return output
 
         handle = layers[inject_layer].register_forward_hook(_steer_hook)
+        latest_hidden = None
+        cap_handles = []
+        if return_hidden:
+            latest_hidden, cap_handles = self._register_layer_capture_hooks(layers)
 
         generated: list[int] = []
+        step_hidden: list[torch.Tensor] = []
         past_key_values = None
         stop_token_id = tokenizer.convert_tokens_to_ids("<|user|>")
 
@@ -369,6 +487,11 @@ class ModelWorker:
                     use_cache=True,
                     return_dict=True,
                 )
+
+                if return_hidden and latest_hidden is not None:
+                    step_h = self._collect_step_layer_hidden(latest_hidden)
+                    if step_h is not None:
+                        step_hidden.append(step_h)
 
                 logits = outputs.logits[:, -1, :]
                 next_token = self._sample_top_p(logits, temperature=temperature, top_p=top_p)
@@ -388,6 +511,8 @@ class ModelWorker:
 
         finally:
             handle.remove()
+            for h in cap_handles:
+                h.remove()
 
         payload = {
             "token_ids": generated,
@@ -395,37 +520,10 @@ class ModelWorker:
         }
 
         if return_hidden:
-            full_ids = torch.cat(
-                [input_ids, torch.tensor(generated, dtype=input_ids.dtype, device=input_ids.device).unsqueeze(0)],
-                dim=1,
-            )
-            prompt_len = int(input_ids.shape[1])
-
-            def _capture_hook(_module, _inputs, output):
-                if isinstance(output, tuple):
-                    hidden = output[0]
-                else:
-                    hidden = output
-                if not isinstance(hidden, torch.Tensor) or hidden.dim() != 3:
-                    return output
-
-                steered = hidden.clone()
-                seq_len = int(steered.shape[1])
-                for step_k, vec in steering_map.items():
-                    pos = prompt_len + int(step_k)
-                    if pos < prompt_len or pos >= seq_len:
-                        continue
-                    steered[:, pos, :] = steered[:, pos, :] + vec.to(steered.dtype)
-
-                if isinstance(output, tuple):
-                    return (steered, *output[1:])
-                return steered
-
-            cap_handle = layers[inject_layer].register_forward_hook(_capture_hook)
-            try:
-                hidden_layers = self._capture_all_layer_hidden(model, full_ids, prompt_len)
-            finally:
-                cap_handle.remove()
+            if step_hidden:
+                hidden_layers = torch.stack(step_hidden, dim=0).to(torch.float16).cpu()
+            else:
+                hidden_layers = torch.empty((0, int(len(layers)), hidden_size if hidden_size > 0 else 0), dtype=torch.float16)
             payload.update(self._pack_hidden_layers_tensor(hidden_layers))
 
         return payload
