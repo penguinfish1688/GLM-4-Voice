@@ -15,6 +15,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 import torch
+import torchaudio
 import torch.nn.functional as F
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
@@ -41,6 +42,12 @@ def parse_args() -> argparse.Namespace:
         "--allow-partial-layers",
         action="store_true",
         help="Allow plotting when some samples have different/missing layer counts",
+    )
+    ap.add_argument(
+        "--wav-token-tol-sec",
+        type=float,
+        default=0.2,
+        help="Allowed absolute difference (sec) between output.wav duration and expected token duration",
     )
     return ap.parse_args()
 
@@ -176,6 +183,43 @@ def maybe_get_times(payload: dict, n_points: int) -> List[float]:
     return (torch.arange(n_points, dtype=torch.float32) / frame_rate).tolist()
 
 
+def assert_output_wav_matches_tokens(payload: dict, tol_sec: float) -> None:
+    output_wav = payload.get("output_wav", None)
+    if not isinstance(output_wav, str) or not output_wav:
+        raise AssertionError("Missing output_wav in payload")
+
+    wav_path = Path(output_wav).expanduser()
+    if not wav_path.is_file():
+        raise AssertionError(f"output_wav does not exist: {wav_path}")
+
+    frame_rate = float(payload.get("frame_rate", 12.5))
+    if frame_rate <= 0:
+        raise AssertionError(f"Invalid frame_rate in payload: {frame_rate}")
+
+    if "hidden_audio_token_count" in payload:
+        audio_token_count = int(payload["hidden_audio_token_count"])
+    elif "hidden_audio_token_mask" in payload:
+        m = payload["hidden_audio_token_mask"]
+        if isinstance(m, torch.Tensor):
+            audio_token_count = int(m.detach().cpu().bool().sum().item())
+        else:
+            audio_token_count = int(torch.tensor(m, dtype=torch.bool).sum().item())
+    else:
+        raise AssertionError("Missing hidden_audio_token_count/hidden_audio_token_mask in payload")
+
+    info = torchaudio.info(str(wav_path))
+    if info.sample_rate <= 0:
+        raise AssertionError(f"Invalid sample rate for {wav_path}: {info.sample_rate}")
+
+    actual_sec = float(info.num_frames) / float(info.sample_rate)
+    expected_sec = float(audio_token_count) / float(frame_rate)
+    if abs(actual_sec - expected_sec) > float(tol_sec):
+        raise AssertionError(
+            f"output.wav duration mismatch: actual={actual_sec:.4f}s expected={expected_sec:.4f}s "
+            f"audio_tokens={audio_token_count} frame_rate={frame_rate} tol={tol_sec}"
+        )
+
+
 def plot_curve(times: List[float], line1: torch.Tensor, line2: torch.Tensor, out_png: Path, sample_id: str, layer: int) -> None:
     import matplotlib.pyplot as plt
 
@@ -251,11 +295,25 @@ def save_anchored_heatmaps(
             frame_rate = float(rec.get("frame_rate", 12.5))
             line1 = np.asarray(rec["line1"], dtype=np.float32)
             line2 = np.asarray(rec["line2"], dtype=np.float32)
+            times = np.asarray(rec.get("times", []), dtype=np.float32)
             if line1.size == 0 or line2.size == 0:
                 continue
 
-            center = int(round(anchor_sec * frame_rate))
-            center = max(0, min(center, line1.shape[0] - 1))
+            center_from_rate = int(round(anchor_sec * frame_rate))
+            center_from_rate = max(0, min(center_from_rate, line1.shape[0] - 1))
+
+            if times.size == line1.shape[0]:
+                center_from_time = int(np.argmin(np.abs(times - float(anchor_sec))))
+                # Ensure input_timing seconds maps to the token index used for plotting.
+                if abs(center_from_time - center_from_rate) > 1:
+                    raise AssertionError(
+                        f"anchor/token index mismatch at {rec['sample_dir']}: "
+                        f"anchor_sec={anchor_sec}, idx_by_time={center_from_time}, idx_by_rate={center_from_rate}"
+                    )
+                center = center_from_time
+            else:
+                center = center_from_rate
+
             in_windows.append(_extract_centered(line1, center, span))
             out_windows.append(_extract_centered(line2, center, span))
 
@@ -280,8 +338,9 @@ def save_anchored_heatmaps(
         if finite.size == 0:
             vmin, vmax = 0.0, 1.0
         else:
-            vmin = float(np.percentile(finite, 5.0))
-            vmax = float(np.percentile(finite, 95.0))
+            # Saturate extreme outliers: clip lower 15% and upper 15%.
+            vmin = float(np.percentile(finite, 15.0))
+            vmax = float(np.percentile(finite, 85.0))
             if vmax <= vmin:
                 vmax = vmin + 1e-6
 
@@ -386,6 +445,8 @@ def main() -> None:
                 print(f"[SKIP] {hp} (too few tokens)")
                 continue
 
+            assert_output_wav_matches_tokens(payload, tol_sec=float(args.wav_token_tol_sec))
+
             if "input_token_ids" in payload:
                 in_ids = payload["input_token_ids"]
                 if isinstance(in_ids, torch.Tensor) and in_ids.ndim == 2 and in_ids.shape[1] >= 1:
@@ -405,15 +466,6 @@ def main() -> None:
                     output_targets = token_ids
             else:
                 output_targets = token_ids
-
-            if "hidden_audio_token_mask" in payload:
-                mask_raw = payload["hidden_audio_token_mask"]
-                if isinstance(mask_raw, torch.Tensor):
-                    audio_mask = mask_raw.detach().cpu().bool().view(-1)
-                else:
-                    audio_mask = torch.tensor(mask_raw, dtype=torch.bool).view(-1)
-            else:
-                audio_mask = (token_ids >= audio_offset)
 
             t, num_layers, _ = hidden.shape
             for lv in range(num_layers):
@@ -442,12 +494,9 @@ def main() -> None:
                 if n == 0:
                     continue
 
-                audio_mask_n = audio_mask[:n].bool()
-                # Keep timeline positions: mark non-audio token CE as NaN instead of dropping rows.
+                # GLM timeline is single-token-per-step; use token CE directly at each time index.
                 line1 = line1.float()
                 line2 = line2.float()
-                line1[~audio_mask_n] = float("nan")
-                line2[~audio_mask_n] = float("nan")
 
                 times = maybe_get_times(payload, n)
                 ratio = (line1 / line2.clamp_min(1e-6)).tolist()
@@ -464,7 +513,7 @@ def main() -> None:
                     "smoothing": "none",
                     "layer": int(lv),
                     "num_points": int(n),
-                    "glm_note": "line1=input CE(listening), line2=output CE(speaking)",
+                    "glm_note": "single-token timeline CE: no text/audio averaging",
                 }
                 with out_json.open("w", encoding="utf-8") as f:
                     json.dump(compat, f, indent=2, ensure_ascii=False)
@@ -475,6 +524,7 @@ def main() -> None:
                         "sample_dir": hp.parent,
                         "line1": line1.tolist(),
                         "line2": line2.tolist(),
+                        "times": times,
                         "frame_rate": float(payload.get("frame_rate", 12.5)),
                     }
                 )
