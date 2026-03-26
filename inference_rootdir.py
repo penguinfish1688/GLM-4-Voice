@@ -132,13 +132,92 @@ def build_prompt(audio_path: Path, whisper_model: WhisperVQEncoder, feature_extr
     return "<|begin_of_audio|>" + token_str + "<|end_of_audio|>"
 
 
+def _decode_hidden_from_payload(payload: dict[str, Any]) -> torch.Tensor:
+    hidden_layers_shape = payload.get("hidden_layers_shape", None)
+    hidden_layers_b64 = payload.get("hidden_layers_b64", "")
+
+    if isinstance(hidden_layers_shape, list) and len(hidden_layers_shape) == 3:
+        raw = base64.b64decode(hidden_layers_b64) if hidden_layers_b64 else b""
+        if hidden_layers_shape[0] == 0:
+            return torch.empty((0, 0, 0), dtype=torch.float16)
+        hidden_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(
+            hidden_layers_shape[0], hidden_layers_shape[1], hidden_layers_shape[2]
+        )
+        return torch.from_numpy(hidden_np)
+
+    # Backward compatibility for older server payloads that only return last-layer hidden.
+    hidden_shape = payload.get("hidden_shape", [0, 0])
+    if not isinstance(hidden_shape, list) or len(hidden_shape) != 2:
+        raise RuntimeError("Invalid response: hidden_shape/hidden_layers_shape")
+
+    hidden_b64 = payload.get("hidden_b64", "")
+    raw = base64.b64decode(hidden_b64) if hidden_b64 else b""
+    if hidden_shape[0] == 0:
+        return torch.empty((0, 0, 0), dtype=torch.float16)
+    hidden_2d_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(hidden_shape[0], hidden_shape[1])
+    hidden_2d = torch.from_numpy(hidden_2d_np)
+    return hidden_2d.unsqueeze(1)
+
+
 def generate_audio(
     prompt: str,
     args: argparse.Namespace,
     glm_tokenizer: Any,
     audio_decoder: AudioDecoder,
-) -> torch.Tensor:
+    inject_layer: int | None = None,
+    steering_map: dict[str, list[float] | None] | None = None,
+    return_hidden: bool = False,
+) -> tuple[torch.Tensor, List[int], torch.Tensor | None]:
     inputs = f"<|system|>\n{args.system_prompt}<|user|>\n{prompt}<|assistant|>streaming_transcription\n"
+
+    # Hidden or steering path: do one generation and decode audio from the same token_ids.
+    if return_hidden or steering_map is not None:
+        if steering_map is not None:
+            if inject_layer is None:
+                raise RuntimeError("inject_layer is required when steering_map is provided")
+            response = requests.post(
+                args.server_steering_url,
+                json={
+                    "prompt": inputs,
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "max_new_tokens": args.max_new_tokens,
+                    "inject_layer": int(inject_layer),
+                    "steering_map": steering_map,
+                    "return_hidden": bool(return_hidden),
+                },
+                timeout=600,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if int(payload.get("error_code", 1)) != 0:
+                raise RuntimeError(f"generate_with_steering failed: {payload}")
+        else:
+            response = requests.post(
+                args.server_hidden_url,
+                json={
+                    "prompt": inputs,
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "max_new_tokens": args.max_new_tokens,
+                },
+                timeout=600,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if int(payload.get("error_code", 1)) != 0:
+                raise RuntimeError(f"generate_with_hidden failed: {payload}")
+
+        token_ids = payload.get("token_ids", [])
+        if not isinstance(token_ids, list):
+            raise RuntimeError("Invalid response: token_ids is not a list")
+
+        hidden_states: torch.Tensor | None = None
+        if return_hidden:
+            hidden_states = _decode_hidden_from_payload(payload)
+
+        tts_speech = decode_audio_from_token_ids([int(x) for x in token_ids], glm_tokenizer, audio_decoder, args.device)
+        return tts_speech, [int(x) for x in token_ids], hidden_states
 
     with torch.no_grad():
         response = requests.post(
@@ -203,59 +282,9 @@ def generate_audio(
         if not tts_speechs:
             raise RuntimeError("Model returned no audio tokens for this sample")
 
-        return torch.cat(tts_speechs, dim=-1).cpu()
+            return torch.cat(tts_speechs, dim=-1).cpu(), [], None
 
-
-def generate_tokens_and_hidden(prompt: str, args: argparse.Namespace) -> tuple[List[int], torch.Tensor]:
-    inputs = f"<|system|>\n{args.system_prompt}<|user|>\n{prompt}<|assistant|>streaming_transcription\n"
-    response = requests.post(
-        args.server_hidden_url,
-        json={
-            "prompt": inputs,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "max_new_tokens": args.max_new_tokens,
-        },
-        timeout=600,
-    )
-    response.raise_for_status()
-    payload = response.json()
-
-    if int(payload.get("error_code", 1)) != 0:
-        raise RuntimeError(f"generate_with_hidden failed: {payload}")
-
-    token_ids = payload.get("token_ids", [])
-    if not isinstance(token_ids, list):
-        raise RuntimeError("Invalid response: token_ids is not a list")
-
-    hidden_layers_shape = payload.get("hidden_layers_shape", None)
-    hidden_layers_b64 = payload.get("hidden_layers_b64", "")
-
-    if isinstance(hidden_layers_shape, list) and len(hidden_layers_shape) == 3:
-        raw = base64.b64decode(hidden_layers_b64) if hidden_layers_b64 else b""
-        if hidden_layers_shape[0] == 0:
-            hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
-        else:
-            hidden_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(
-                hidden_layers_shape[0], hidden_layers_shape[1], hidden_layers_shape[2]
-            )
-            hidden_states = torch.from_numpy(hidden_np)
-    else:
-        # Backward compatibility for older server payloads that only return last-layer hidden.
-        hidden_shape = payload.get("hidden_shape", [0, 0])
-        if not isinstance(hidden_shape, list) or len(hidden_shape) != 2:
-            raise RuntimeError("Invalid response: hidden_shape/hidden_layers_shape")
-
-        hidden_b64 = payload.get("hidden_b64", "")
-        raw = base64.b64decode(hidden_b64) if hidden_b64 else b""
-        if hidden_shape[0] == 0:
-            hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
-        else:
-            hidden_2d_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(hidden_shape[0], hidden_shape[1])
-            hidden_2d = torch.from_numpy(hidden_2d_np)
-            hidden_states = hidden_2d.unsqueeze(1)
-
-    return [int(x) for x in token_ids], hidden_states
+    raise RuntimeError("Unreachable: generate_audio did not return")
 
 
 def decode_audio_from_token_ids(
@@ -394,68 +423,6 @@ def load_steering_map(sample_dir: Path, inject_layer: int) -> dict[str, list[flo
     return layer_payload
 
 
-def generate_tokens_with_steering(
-    prompt: str,
-    args: argparse.Namespace,
-    inject_layer: int,
-    steering_map: dict[str, list[float] | None],
-) -> tuple[List[int], torch.Tensor | None]:
-    inputs = f"<|system|>\n{args.system_prompt}<|user|>\n{prompt}<|assistant|>streaming_transcription\n"
-
-    response = requests.post(
-        args.server_steering_url,
-        json={
-            "prompt": inputs,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "max_new_tokens": args.max_new_tokens,
-            "inject_layer": inject_layer,
-            "steering_map": steering_map,
-            "return_hidden": bool(args.save_hidden),
-        },
-        timeout=600,
-    )
-    response.raise_for_status()
-    payload = response.json()
-
-    if int(payload.get("error_code", 1)) != 0:
-        raise RuntimeError(f"generate_with_steering failed: {payload}")
-
-    token_ids = payload.get("token_ids", [])
-    if not isinstance(token_ids, list):
-        raise RuntimeError("Invalid response: token_ids is not a list")
-
-    hidden_states: torch.Tensor | None = None
-    if args.save_hidden:
-        hidden_layers_shape = payload.get("hidden_layers_shape", None)
-        hidden_layers_b64 = payload.get("hidden_layers_b64", "")
-
-        if isinstance(hidden_layers_shape, list) and len(hidden_layers_shape) == 3:
-            raw = base64.b64decode(hidden_layers_b64) if hidden_layers_b64 else b""
-            if hidden_layers_shape[0] == 0:
-                hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
-            else:
-                hidden_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(
-                    hidden_layers_shape[0], hidden_layers_shape[1], hidden_layers_shape[2]
-                )
-                hidden_states = torch.from_numpy(hidden_np)
-        else:
-            hidden_shape = payload.get("hidden_shape", [0, 0])
-            if not isinstance(hidden_shape, list) or len(hidden_shape) != 2:
-                raise RuntimeError("Invalid response: hidden_shape/hidden_layers_shape")
-
-            hidden_b64 = payload.get("hidden_b64", "")
-            raw = base64.b64decode(hidden_b64) if hidden_b64 else b""
-            if hidden_shape[0] == 0:
-                hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
-            else:
-                hidden_2d_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(hidden_shape[0], hidden_shape[1])
-                hidden_2d = torch.from_numpy(hidden_2d_np)
-                hidden_states = hidden_2d.unsqueeze(1)
-
-    return [int(x) for x in token_ids], hidden_states
-
-
 def main() -> None:
     args = parse_args()
 
@@ -515,43 +482,37 @@ def main() -> None:
         try:
             prompt = build_prompt(input_path, whisper_model, feature_extractor)
             audio_decode_fallback_used = False
-            audio_decode_source = "hidden_tokens"
+            audio_decode_source = "stream"
             has_audio_tokens_in_hidden = True
             hidden_audio_token_count = 0
             if args.inference_with_steering:
                 steering_map = load_steering_map(input_path.parent, int(args.inject_layer))
-                token_ids, hidden_states = generate_tokens_with_steering(
-                    prompt=prompt,
-                    args=args,
+                tts_speech, token_ids, hidden_states = generate_audio(
+                    prompt,
+                    args,
+                    glm_tokenizer,
+                    audio_decoder,
                     inject_layer=int(args.inject_layer),
                     steering_map=steering_map,
+                    return_hidden=bool(args.save_hidden),
                 )
-                hidden_audio_token_count = count_audio_tokens(token_ids, glm_tokenizer)
-                has_audio_tokens_in_hidden = hidden_audio_token_count > 0
-                try:
-                    tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
-                except RuntimeError as ex:
-                    if "No audio tokens returned from model" not in str(ex):
-                        raise
-                    print("[WARN] steering hidden path returned no audio tokens, fallback to stream decode")
-                    audio_decode_fallback_used = True
-                    audio_decode_source = "stream_fallback"
-                    tts_speech = generate_audio(prompt, args, glm_tokenizer, audio_decoder)
+                if args.save_hidden:
+                    audio_decode_source = "hidden_tokens"
+                    hidden_audio_token_count = count_audio_tokens(token_ids, glm_tokenizer)
+                    has_audio_tokens_in_hidden = hidden_audio_token_count > 0
             elif args.save_hidden:
-                token_ids, hidden_states = generate_tokens_and_hidden(prompt, args)
+                tts_speech, token_ids, hidden_states = generate_audio(
+                    prompt,
+                    args,
+                    glm_tokenizer,
+                    audio_decoder,
+                    return_hidden=True,
+                )
+                audio_decode_source = "hidden_tokens"
                 hidden_audio_token_count = count_audio_tokens(token_ids, glm_tokenizer)
                 has_audio_tokens_in_hidden = hidden_audio_token_count > 0
-                try:
-                    tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
-                except RuntimeError as ex:
-                    if "No audio tokens returned from model" not in str(ex):
-                        raise
-                    print("[WARN] hidden path returned no audio tokens, fallback to stream decode")
-                    audio_decode_fallback_used = True
-                    audio_decode_source = "stream_fallback"
-                    tts_speech = generate_audio(prompt, args, glm_tokenizer, audio_decoder)
             else:
-                tts_speech = generate_audio(prompt, args, glm_tokenizer, audio_decoder)
+                tts_speech, token_ids, hidden_states = generate_audio(prompt, args, glm_tokenizer, audio_decoder)
             torchaudio.save(str(output_path), tts_speech.unsqueeze(0), 22050, format="wav")
 
             if args.save_hidden:
