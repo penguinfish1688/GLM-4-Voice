@@ -14,9 +14,11 @@ import base64
 import json
 import os
 import re
+import socket
 from glob import glob
 from pathlib import Path
 from typing import Any, Iterable, List
+from urllib.parse import urlparse
 import uuid
 
 import requests
@@ -84,6 +86,29 @@ def list_input_files(root_dir: str, prefix: str, input_name: str) -> List[Path]:
     root = Path(root_dir).expanduser()
     pattern = str(root / f"*/{prefix}{input_name}")
     return [Path(p) for p in sorted(glob(pattern))]
+
+
+def assert_server_reachable(endpoint_url: str, timeout_sec: float = 3.0) -> None:
+    parsed = urlparse(endpoint_url)
+    host = parsed.hostname
+    port = parsed.port
+
+    if host is None:
+        raise RuntimeError(f"Invalid endpoint URL: {endpoint_url}")
+
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout_sec):
+            return
+    except OSError as exc:
+        raise RuntimeError(
+            "Cannot connect to GLM model server at "
+            f"{host}:{port} (from {endpoint_url}). "
+            "Start model_server.py first, for example: "
+            "python model_server.py --host localhost --port 10000 --model-path THUDM/glm-4-voice-9b --dtype bfloat16 --device cuda:0"
+        ) from exc
 
 
 def iter_token_ids(response: requests.Response) -> Iterable[int]:
@@ -345,6 +370,15 @@ def main() -> None:
 
     if not torch.cuda.is_available() and args.device.startswith("cuda"):
         raise RuntimeError("CUDA device requested but not available")
+
+    required_endpoint = args.server_url
+    if args.inference_with_steering:
+        required_endpoint = args.server_steering_url
+    elif args.save_hidden:
+        required_endpoint = args.server_hidden_url
+
+    print(f"[CHECK] verifying model server: {required_endpoint}")
+    assert_server_reachable(required_endpoint)
 
     flow_config = os.path.join(args.flow_path, "config.yaml")
     flow_checkpoint = os.path.join(args.flow_path, "flow.pt")
