@@ -73,6 +73,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--device", default="cuda", help="Inference device for tokenizer/decoder")
+    parser.add_argument(
+        "--asr-device",
+        default="cpu",
+        help="Device for Whisper speech-token extraction (default cpu to reduce GPU memory)",
+    )
     return parser.parse_args()
 
 
@@ -483,6 +488,8 @@ def main() -> None:
 
     if not torch.cuda.is_available() and args.device.startswith("cuda"):
         raise RuntimeError("CUDA device requested but not available")
+    if args.asr_device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA asr-device requested but not available")
 
     flow_config = os.path.join(args.flow_path, "config.yaml")
     flow_checkpoint = os.path.join(args.flow_path, "flow.pt")
@@ -492,7 +499,7 @@ def main() -> None:
     glm_tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     glm_model = _load_local_glm_model(args)
 
-    whisper_model = WhisperVQEncoder.from_pretrained(args.tokenizer_path).eval().to(args.device)
+    whisper_model = WhisperVQEncoder.from_pretrained(args.tokenizer_path).eval().to(args.asr_device)
     feature_extractor = WhisperFeatureExtractor.from_pretrained(args.tokenizer_path)
     audio_decoder = AudioDecoder(
         config_path=flow_config,
@@ -526,6 +533,9 @@ def main() -> None:
 
         try:
             prompt = build_prompt(input_path, whisper_model, feature_extractor)
+            if args.device.startswith("cuda"):
+                # Prompt extraction can allocate transient CUDA buffers in some backends.
+                torch.cuda.empty_cache()
             audio_decode_fallback_used = False
             audio_decode_source = "stream"
             has_audio_tokens_in_hidden = True
@@ -605,7 +615,12 @@ def main() -> None:
             success += 1
         except Exception as exc:
             print(f"[FAIL] {input_path}: {exc}")
+            if args.device.startswith("cuda") and "out of memory" in str(exc).lower():
+                torch.cuda.empty_cache()
             failed += 1
+        finally:
+            if args.device.startswith("cuda"):
+                torch.cuda.empty_cache()
 
     print(f"[DONE] success={success}, failed={failed}")
 
