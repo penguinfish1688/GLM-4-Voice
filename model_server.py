@@ -346,60 +346,85 @@ class ModelWorker:
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask", None)
 
-        generated: list[int] = []
-        step_hidden: list[torch.Tensor] = []
-        past_key_values = None
-        stop_token_id = tokenizer.convert_tokens_to_ids("<|user|>")
+        try:
+            generated: list[int] = []
+            step_hidden: list[torch.Tensor] = []
+            past_key_values = None
+            stop_token_id = tokenizer.convert_tokens_to_ids("<|user|>")
 
-        cur_input_ids = input_ids
-        cur_attention_mask = attention_mask
+            cur_input_ids = input_ids
+            cur_attention_mask = attention_mask
 
-        for _step in range(max_new_tokens):
-            outputs = model(
-                input_ids=cur_input_ids,
-                attention_mask=cur_attention_mask,
-                past_key_values=past_key_values,
-                use_cache=True,
+            for _step in range(max_new_tokens):
+                outputs = model(
+                    input_ids=cur_input_ids,
+                    attention_mask=cur_attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+
+                step_h = self._collect_step_hidden_from_outputs(outputs)
+                if step_h is not None:
+                    step_hidden.append(step_h)
+
+                logits = outputs.logits[:, -1, :]
+                next_token = self._sample_top_p(logits, temperature=temperature, top_p=top_p)
+                token_id = int(next_token.item())
+                generated.append(token_id)
+
+                if token_id == stop_token_id:
+                    break
+
+                past_key_values = outputs.past_key_values
+                cur_input_ids = next_token.unsqueeze(0)
+                if cur_attention_mask is not None:
+                    cur_attention_mask = torch.cat(
+                        [
+                            cur_attention_mask,
+                            torch.ones((1, 1), device=cur_attention_mask.device, dtype=cur_attention_mask.dtype),
+                        ],
+                        dim=1,
+                    )
+
+            if step_hidden:
+                hidden_layers = torch.stack(step_hidden, dim=0).to(torch.float16).cpu()
+            else:
+                hidden_size = int(getattr(model.config, "hidden_size", 0))
+                hidden_layers = torch.empty((0, 0, hidden_size), dtype=torch.float16)
+
+            hidden_payload = self._pack_hidden_layers_tensor(hidden_layers)
+            return {
+                "token_ids": generated,
+                **hidden_payload,
+                "error_code": 0,
+            }
+        except Exception:
+            # Fallback to a robust two-pass path if step-wise hidden capture fails.
+            prompt_len = int(input_ids.shape[1])
+            out = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=True,
+                return_dict_in_generate=True,
+            )
+            sequences = out.sequences
+            generated_ids = sequences[0][prompt_len:]
+
+            forward_out = model(
+                input_ids=sequences,
                 output_hidden_states=True,
                 return_dict=True,
             )
-
-            step_h = self._collect_step_hidden_from_outputs(outputs)
-            if step_h is not None:
-                step_hidden.append(step_h)
-
-            logits = outputs.logits[:, -1, :]
-            next_token = self._sample_top_p(logits, temperature=temperature, top_p=top_p)
-            token_id = int(next_token.item())
-            generated.append(token_id)
-
-            if token_id == stop_token_id:
-                break
-
-            past_key_values = outputs.past_key_values
-            cur_input_ids = next_token.unsqueeze(0)
-            if cur_attention_mask is not None:
-                cur_attention_mask = torch.cat(
-                    [
-                        cur_attention_mask,
-                        torch.ones((1, 1), device=cur_attention_mask.device, dtype=cur_attention_mask.dtype),
-                    ],
-                    dim=1,
-                )
-
-        if step_hidden:
-            hidden_layers = torch.stack(step_hidden, dim=0).to(torch.float16).cpu()
-        else:
-            hidden_size = int(getattr(model.config, "hidden_size", 0))
-            hidden_layers = torch.empty((0, 0, hidden_size), dtype=torch.float16)
-
-        hidden_payload = self._pack_hidden_layers_tensor(hidden_layers)
-
-        return {
-            "token_ids": generated,
-            **hidden_payload,
-            "error_code": 0,
-        }
+            hidden_payload = self._pack_generated_hidden_layers(forward_out.hidden_states, prompt_len)
+            return {
+                "token_ids": generated_ids.detach().cpu().tolist(),
+                **hidden_payload,
+                "error_code": 0,
+            }
 
     def generate_with_hidden_gate(self, params):
         try:
@@ -415,7 +440,7 @@ class ModelWorker:
                 "hidden_shape": [0, 0],
                 "hidden_b64": "",
                 "error_code": 1,
-                "text": "Server Error",
+                "text": f"Server Error: {e}",
             }
 
     @torch.inference_mode()
