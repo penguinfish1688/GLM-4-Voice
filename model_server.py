@@ -146,6 +146,60 @@ class ModelWorker:
             "hidden_b64": base64.b64encode(last_hidden_np.tobytes()).decode("ascii"),
         }
 
+    def _capture_all_layer_hidden(self, model: Any, input_ids: torch.Tensor, prompt_len: int) -> torch.Tensor:
+        layers = self._get_transformer_layers(model)
+        captured: list[torch.Tensor | None] = [None] * len(layers)
+        handles = []
+
+        def _mk_hook(idx: int):
+            def _hook(_module, _inputs, output):
+                hidden = output[0] if isinstance(output, tuple) else output
+                if isinstance(hidden, torch.Tensor) and hidden.dim() == 3:
+                    captured[idx] = hidden
+                return output
+
+            return _hook
+
+        for idx, layer in enumerate(layers):
+            handles.append(layer.register_forward_hook(_mk_hook(idx)))
+
+        try:
+            model(input_ids=input_ids, return_dict=True)
+        finally:
+            for h in handles:
+                h.remove()
+
+        per_layer: list[torch.Tensor] = []
+        for hidden in captured:
+            if hidden is None:
+                continue
+            per_layer.append(hidden[0, prompt_len:, :])
+
+        if len(per_layer) == 0:
+            return torch.empty((0, 0, 0), dtype=torch.float16)
+
+        return torch.stack(per_layer, dim=1).detach().cpu().to(torch.float16)
+
+    @staticmethod
+    def _pack_hidden_layers_tensor(hidden_layers: torch.Tensor) -> dict[str, Any]:
+        if hidden_layers.dim() != 3:
+            raise RuntimeError(f"Expected hidden_layers rank-3 tensor, got rank {hidden_layers.dim()}")
+
+        if hidden_layers.shape[1] > 0:
+            last_hidden = hidden_layers[:, -1, :]
+        else:
+            last_hidden = torch.empty((int(hidden_layers.shape[0]), 0), dtype=hidden_layers.dtype)
+
+        hidden_layers_np = hidden_layers.numpy()
+        last_hidden_np = last_hidden.numpy()
+        return {
+            "hidden_dtype": "float16",
+            "hidden_layers_shape": list(hidden_layers_np.shape),
+            "hidden_layers_b64": base64.b64encode(hidden_layers_np.tobytes()).decode("ascii"),
+            "hidden_shape": list(last_hidden_np.shape),
+            "hidden_b64": base64.b64encode(last_hidden_np.tobytes()).decode("ascii"),
+        }
+
     @torch.inference_mode()
     def generate_stream(self, params):
         tokenizer, model = self.glm_tokenizer, self.glm_model
@@ -211,12 +265,8 @@ class ModelWorker:
         full_ids = sequences[0]
         generated_ids = full_ids[prompt_len:]
 
-        forward_out = model(
-            input_ids=sequences,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        hidden_payload = self._pack_generated_hidden_layers(forward_out.hidden_states, prompt_len)
+        hidden_layers = self._capture_all_layer_hidden(model, sequences, prompt_len)
+        hidden_payload = self._pack_hidden_layers_tensor(hidden_layers)
 
         return {
             "token_ids": generated_ids.detach().cpu().tolist(),
@@ -373,14 +423,10 @@ class ModelWorker:
 
             cap_handle = layers[inject_layer].register_forward_hook(_capture_hook)
             try:
-                forward_out = model(
-                    input_ids=full_ids,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
+                hidden_layers = self._capture_all_layer_hidden(model, full_ids, prompt_len)
             finally:
                 cap_handle.remove()
-            payload.update(self._pack_generated_hidden_layers(forward_out.hidden_states, prompt_len))
+            payload.update(self._pack_hidden_layers_tensor(hidden_layers))
 
         return payload
 
