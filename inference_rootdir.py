@@ -369,6 +369,9 @@ def save_hidden_payload(
         "ce_exclude_reason": "hidden_tokens_have_no_audio" if not has_audio_tokens_in_hidden else "",
     }
     torch.save(payload, hidden_path)
+    saved_tokens = int(text_hidden_layers.shape[0])
+    saved_layers = int(text_hidden_layers.shape[1]) if text_hidden_layers.ndim == 3 else 0
+    print(f"[HIDDEN] saved {hidden_path} tokens={saved_tokens} layers={saved_layers}")
 
 
 def load_steering_map(sample_dir: Path, inject_layer: int) -> dict[str, list[float] | None]:
