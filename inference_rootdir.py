@@ -274,6 +274,11 @@ def save_hidden_payload(
     hidden_states: torch.Tensor,
     glm_tokenizer: Any,
 ) -> None:
+    out_token_ids = torch.tensor(token_ids, dtype=torch.long).view(-1, 1)
+    in_token_ids = torch.full_like(out_token_ids, fill_value=-1)
+    if out_token_ids.shape[0] > 1:
+        in_token_ids[1:, 0] = out_token_ids[:-1, 0]
+
     t = int(hidden_states.shape[0])
     frame_rate_hz = 12.5
     times = torch.arange(t, dtype=torch.float32) / frame_rate_hz
@@ -284,8 +289,12 @@ def save_hidden_payload(
         "input_wav": str(input_path),
         "output_wav": str(output_path),
         "frame_rate": float(frame_rate_hz),
-        "token_ids": torch.tensor(token_ids, dtype=torch.long),
+        "token_ids": out_token_ids.view(-1),
         "token_names": glm_tokenizer.convert_ids_to_tokens(token_ids),
+        "input_token_ids": in_token_ids,
+        "input_token_width": 1,
+        "output_token_ids": out_token_ids,
+        "output_token_width": 1,
         "times": times,
         "token_time_ranges_sec": token_time_ranges,
         "hidden_states": hidden_states.float().cpu(),
