@@ -38,6 +38,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-name", default="output_hidden.pt", help="Hidden payload filename")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output wav")
     parser.add_argument("--save-hidden", action="store_true", help="Save hidden payload next to output wav")
+    parser.add_argument(
+        "--inference-with-steering",
+        action="store_true",
+        help="Read root_dir/*/steering_vector.json and run steering inference",
+    )
+    parser.add_argument(
+        "--inject-layer",
+        type=int,
+        default=None,
+        help="Layer index for steering injection (required with --inference-with-steering)",
+    )
 
     parser.add_argument("--model-path", default="THUDM/glm-4-voice-9b", help="GLM model path")
     parser.add_argument("--tokenizer-path", default="THUDM/glm-4-voice-tokenizer", help="Speech tokenizer path")
@@ -47,6 +58,11 @@ def parse_args() -> argparse.Namespace:
         "--server-hidden-url",
         default="http://localhost:10000/generate_with_hidden",
         help="Model server endpoint returning token ids and hidden states",
+    )
+    parser.add_argument(
+        "--server-steering-url",
+        default="http://localhost:10000/generate_with_steering",
+        help="Model server endpoint for steering inference",
     )
 
     parser.add_argument("--temperature", type=float, default=0.2)
@@ -253,8 +269,79 @@ def save_hidden_payload(
     torch.save(payload, hidden_path)
 
 
+def load_steering_map(sample_dir: Path, inject_layer: int) -> dict[str, list[float] | None]:
+    steering_path = sample_dir / "steering_vector.json"
+    if not steering_path.exists():
+        raise FileNotFoundError(f"Missing steering file: {steering_path}")
+
+    payload = json.loads(steering_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid steering payload in {steering_path}: expected dict")
+
+    layer_key = f"layer_{inject_layer}"
+    if layer_key not in payload:
+        keys = ", ".join(sorted(payload.keys()))
+        raise KeyError(f"{steering_path} has no '{layer_key}'. Available keys: [{keys}]")
+
+    layer_payload = payload[layer_key]
+    if not isinstance(layer_payload, dict):
+        raise RuntimeError(f"Invalid {layer_key} payload in {steering_path}: expected dict")
+    return layer_payload
+
+
+def generate_tokens_with_steering(
+    prompt: str,
+    args: argparse.Namespace,
+    inject_layer: int,
+    steering_map: dict[str, list[float] | None],
+) -> tuple[List[int], torch.Tensor | None]:
+    inputs = f"<|system|>\n{args.system_prompt}<|user|>\n{prompt}<|assistant|>streaming_transcription\n"
+
+    response = requests.post(
+        args.server_steering_url,
+        json={
+            "prompt": inputs,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_new_tokens": args.max_new_tokens,
+            "inject_layer": inject_layer,
+            "steering_map": steering_map,
+            "return_hidden": bool(args.save_hidden),
+        },
+        timeout=600,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    if int(payload.get("error_code", 1)) != 0:
+        raise RuntimeError(f"generate_with_steering failed: {payload}")
+
+    token_ids = payload.get("token_ids", [])
+    if not isinstance(token_ids, list):
+        raise RuntimeError("Invalid response: token_ids is not a list")
+
+    hidden_states: torch.Tensor | None = None
+    if args.save_hidden:
+        hidden_shape = payload.get("hidden_shape", [0, 0])
+        if not isinstance(hidden_shape, list) or len(hidden_shape) != 2:
+            raise RuntimeError("Invalid response: hidden_shape")
+
+        hidden_b64 = payload.get("hidden_b64", "")
+        raw = base64.b64decode(hidden_b64) if hidden_b64 else b""
+
+        if hidden_shape[0] == 0:
+            hidden_states = torch.empty((0, 0), dtype=torch.float16)
+        else:
+            hidden_states = torch.frombuffer(raw, dtype=torch.float16).clone().reshape(hidden_shape[0], hidden_shape[1])
+
+    return [int(x) for x in token_ids], hidden_states
+
+
 def main() -> None:
     args = parse_args()
+
+    if args.inference_with_steering and args.inject_layer is None:
+        raise ValueError("--inference-with-steering requires --inject-layer")
 
     if not torch.cuda.is_available() and args.device.startswith("cuda"):
         raise RuntimeError("CUDA device requested but not available")
@@ -299,7 +386,16 @@ def main() -> None:
 
         try:
             prompt = build_prompt(input_path, whisper_model, feature_extractor)
-            if args.save_hidden:
+            if args.inference_with_steering:
+                steering_map = load_steering_map(input_path.parent, int(args.inject_layer))
+                token_ids, hidden_states = generate_tokens_with_steering(
+                    prompt=prompt,
+                    args=args,
+                    inject_layer=int(args.inject_layer),
+                    steering_map=steering_map,
+                )
+                tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
+            elif args.save_hidden:
                 token_ids, hidden_states = generate_tokens_and_hidden(prompt, args)
                 tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
             else:
@@ -307,6 +403,8 @@ def main() -> None:
             torchaudio.save(str(output_path), tts_speech.unsqueeze(0), 22050, format="wav")
 
             if args.save_hidden:
+                if hidden_states is None:
+                    raise RuntimeError("Expected hidden states but received None")
                 save_hidden_payload(
                     hidden_path=hidden_path,
                     input_path=input_path,
@@ -315,9 +413,15 @@ def main() -> None:
                     hidden_states=hidden_states,
                     glm_tokenizer=glm_tokenizer,
                 )
-                print(f"[OK] {output_path} + {hidden_path}")
+                if args.inference_with_steering:
+                    print(f"[OK] {output_path} + {hidden_path} (steered layer={int(args.inject_layer)})")
+                else:
+                    print(f"[OK] {output_path} + {hidden_path}")
             else:
-                print(f"[OK] {output_path}")
+                if args.inference_with_steering:
+                    print(f"[OK] {output_path} (steered layer={int(args.inject_layer)})")
+                else:
+                    print(f"[OK] {output_path}")
             success += 1
         except Exception as exc:
             print(f"[FAIL] {input_path}: {exc}")

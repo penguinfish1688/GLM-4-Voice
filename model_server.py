@@ -13,6 +13,7 @@ python model_server.py --host localhost --model-path THUDM/glm-4-voice-9b --port
 import argparse
 import json
 import base64
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -20,7 +21,6 @@ from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 from transformers.generation.streamers import BaseStreamer
 import torch
 import uvicorn
-import numpy as np
 
 from threading import Thread
 from queue import Queue
@@ -80,6 +80,45 @@ class ModelWorker:
             device_map={"": 0}
         ).eval()
         self.glm_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+    @staticmethod
+    def _sample_top_p(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
+        if temperature <= 0:
+            return torch.argmax(logits, dim=-1)
+
+        logits = logits / max(temperature, 1e-6)
+        probs = torch.softmax(logits, dim=-1)
+
+        if top_p >= 1.0:
+            return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+        cumsum = torch.cumsum(sorted_probs, dim=-1)
+        keep = cumsum <= top_p
+        keep[..., 0] = True
+
+        filtered = torch.where(keep, sorted_probs, torch.zeros_like(sorted_probs))
+        filtered = filtered / filtered.sum(dim=-1, keepdim=True)
+        sampled_local = torch.multinomial(filtered, num_samples=1)
+        sampled = torch.gather(sorted_indices, -1, sampled_local).squeeze(-1)
+        return sampled
+
+    @staticmethod
+    def _get_transformer_layers(model: Any):
+        candidates = [
+            ("transformer", "layers"),
+            ("model", "layers"),
+            ("encoder", "layers"),
+        ]
+        for parent_name, child_name in candidates:
+            parent = getattr(model, parent_name, None)
+            if parent is not None and hasattr(parent, child_name):
+                layers = getattr(parent, child_name)
+                if hasattr(layers, "__len__"):
+                    return layers
+        if hasattr(model, "layers") and hasattr(model.layers, "__len__"):
+            return model.layers
+        raise RuntimeError("Unable to locate transformer layers on this model")
 
     @torch.inference_mode()
     def generate_stream(self, params):
@@ -176,6 +215,170 @@ class ModelWorker:
                 "text": "Server Error",
             }
 
+    @torch.inference_mode()
+    def generate_with_steering(self, params):
+        tokenizer, model = self.glm_tokenizer, self.glm_model
+
+        prompt = params["prompt"]
+        temperature = float(params.get("temperature", 0.2))
+        top_p = float(params.get("top_p", 0.8))
+        max_new_tokens = int(params.get("max_new_tokens", 256))
+        inject_layer = int(params.get("inject_layer", -1))
+        steering_map_raw = params.get("steering_map", {})
+        return_hidden = bool(params.get("return_hidden", False))
+
+        if not isinstance(steering_map_raw, dict):
+            raise ValueError("steering_map must be a dict of step->vector")
+
+        inputs = tokenizer([prompt], return_tensors="pt").to(self.device)
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs.get("attention_mask", None)
+
+        layers = self._get_transformer_layers(model)
+        num_layers = len(layers)
+        if inject_layer < 0:
+            inject_layer = num_layers + inject_layer
+        if inject_layer < 0 or inject_layer >= num_layers:
+            raise ValueError(f"inject_layer {inject_layer} out of range [0, {num_layers - 1}]")
+
+        hidden_size = int(getattr(model.config, "hidden_size", 0))
+        steering_map: dict[int, torch.Tensor] = {}
+        for step_k, vec in steering_map_raw.items():
+            if vec is None:
+                continue
+            step = int(step_k)
+            v = torch.tensor(vec, device=self.device, dtype=torch.float32)
+            if hidden_size > 0 and int(v.numel()) != hidden_size:
+                raise ValueError(
+                    f"steering vector dim mismatch at step {step}: got {int(v.numel())}, expected {hidden_size}"
+                )
+            steering_map[step] = v
+
+        step_state = {"step": 0}
+
+        def _steer_hook(_module, _inputs, output):
+            vec = steering_map.get(step_state["step"])
+            if vec is None:
+                return output
+
+            if isinstance(output, tuple):
+                hidden = output[0]
+                if hidden.dim() == 3:
+                    steered = hidden.clone()
+                    steered[:, -1, :] = steered[:, -1, :] + vec.to(steered.dtype)
+                    return (steered, *output[1:])
+                return output
+
+            if isinstance(output, torch.Tensor) and output.dim() == 3:
+                steered = output.clone()
+                steered[:, -1, :] = steered[:, -1, :] + vec.to(steered.dtype)
+                return steered
+            return output
+
+        handle = layers[inject_layer].register_forward_hook(_steer_hook)
+
+        generated: list[int] = []
+        past_key_values = None
+        stop_token_id = tokenizer.convert_tokens_to_ids("<|user|>")
+
+        try:
+            cur_input_ids = input_ids
+            cur_attention_mask = attention_mask
+
+            for step in range(max_new_tokens):
+                step_state["step"] = step
+                outputs = model(
+                    input_ids=cur_input_ids,
+                    attention_mask=cur_attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+
+                logits = outputs.logits[:, -1, :]
+                next_token = self._sample_top_p(logits, temperature=temperature, top_p=top_p)
+                token_id = int(next_token.item())
+                generated.append(token_id)
+
+                if token_id == stop_token_id:
+                    break
+
+                past_key_values = outputs.past_key_values
+                cur_input_ids = next_token.unsqueeze(0)
+                if cur_attention_mask is not None:
+                    cur_attention_mask = torch.cat(
+                        [cur_attention_mask, torch.ones((1, 1), device=cur_attention_mask.device, dtype=cur_attention_mask.dtype)],
+                        dim=1,
+                    )
+
+        finally:
+            handle.remove()
+
+        payload = {
+            "token_ids": generated,
+            "error_code": 0,
+        }
+
+        if return_hidden:
+            full_ids = torch.cat(
+                [input_ids, torch.tensor(generated, dtype=input_ids.dtype, device=input_ids.device).unsqueeze(0)],
+                dim=1,
+            )
+            prompt_len = int(input_ids.shape[1])
+
+            def _capture_hook(_module, _inputs, output):
+                if isinstance(output, tuple):
+                    hidden = output[0]
+                else:
+                    hidden = output
+                if not isinstance(hidden, torch.Tensor) or hidden.dim() != 3:
+                    return output
+
+                steered = hidden.clone()
+                seq_len = int(steered.shape[1])
+                for step_k, vec in steering_map.items():
+                    pos = prompt_len + int(step_k)
+                    if pos < prompt_len or pos >= seq_len:
+                        continue
+                    steered[:, pos, :] = steered[:, pos, :] + vec.to(steered.dtype)
+
+                if isinstance(output, tuple):
+                    return (steered, *output[1:])
+                return steered
+
+            cap_handle = layers[inject_layer].register_forward_hook(_capture_hook)
+            try:
+                forward_out = model(
+                    input_ids=full_ids,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+            finally:
+                cap_handle.remove()
+
+            last_hidden = forward_out.hidden_states[-1][0, prompt_len:, :]
+            hidden_np = last_hidden.detach().cpu().to(torch.float16).numpy()
+            payload.update(
+                {
+                    "hidden_dtype": "float16",
+                    "hidden_shape": list(hidden_np.shape),
+                    "hidden_b64": base64.b64encode(hidden_np.tobytes()).decode("ascii"),
+                }
+            )
+
+        return payload
+
+    def generate_with_steering_gate(self, params):
+        try:
+            return self.generate_with_steering(params)
+        except Exception as e:
+            print("Caught Unknown Error", e)
+            return {
+                "token_ids": [],
+                "error_code": 1,
+                "text": "Server Error",
+            }
+
 
 app = FastAPI()
 
@@ -192,6 +395,13 @@ async def generate_stream(request: Request):
 async def generate_with_hidden(request: Request):
     params = await request.json()
     payload = worker.generate_with_hidden_gate(params)
+    return JSONResponse(payload)
+
+
+@app.post("/generate_with_steering")
+async def generate_with_steering(request: Request):
+    params = await request.json()
+    payload = worker.generate_with_steering_gate(params)
     return JSONResponse(payload)
 
 
