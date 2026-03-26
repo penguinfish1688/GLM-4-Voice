@@ -2,30 +2,24 @@
 """
 Batch inference for GLM-4-Voice on dataset layout: root_dir/*/input.wav.
 
-This script reads each input wav and writes output wav in the same folder.
-It reuses GLM-4-Voice's speech tokenizer + decoder and calls model_server.py
-for streamed token generation.
+This script runs GLM generation locally in a single process (no model_server).
+For each input.wav, it writes output.wav and optionally output_hidden.pt.
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
 import json
-import numpy as np
 import os
 import re
-import socket
 from glob import glob
 from pathlib import Path
-from typing import Any, Iterable, List
-from urllib.parse import urlparse
-import uuid
+from typing import Any, List
 
-import requests
+import numpy as np
 import torch
 import torchaudio
-from transformers import AutoTokenizer, WhisperFeatureExtractor
+from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, WhisperFeatureExtractor
 
 from flow_inference import AudioDecoder
 from speech_tokenizer.modeling_whisper import WhisperVQEncoder
@@ -36,7 +30,7 @@ AUDIO_TOKEN_RE = re.compile(r"<\|audio_(\d+)\|>")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("glm4voice_rootdir_inference")
+    parser = argparse.ArgumentParser("glm4voice_rootdir_inference_local")
     parser.add_argument("--root-dir", required=True, help="Dataset root containing */input.wav")
     parser.add_argument("--prefix", default="", help="Input/output filename prefix. Example: clean_")
     parser.add_argument("--input-name", default="input.wav", help="Input wav filename")
@@ -57,19 +51,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--model-path", default="THUDM/glm-4-voice-9b", help="GLM model path")
+    parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32", "int4"])
     parser.add_argument("--tokenizer-path", default="THUDM/glm-4-voice-tokenizer", help="Speech tokenizer path")
     parser.add_argument("--flow-path", default="./glm-4-voice-decoder", help="Decoder checkpoint directory")
-    parser.add_argument("--server-url", default="http://localhost:10000/generate_stream", help="Model server endpoint")
-    parser.add_argument(
-        "--server-hidden-url",
-        default="http://localhost:10000/generate_with_hidden",
-        help="Model server endpoint returning token ids and hidden states",
-    )
-    parser.add_argument(
-        "--server-steering-url",
-        default="http://localhost:10000/generate_with_steering",
-        help="Model server endpoint for steering inference",
-    )
 
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.8)
@@ -98,218 +82,198 @@ def list_input_files(root_dir: str, prefix: str, input_name: str) -> List[Path]:
     return [Path(p) for p in sorted(glob(pattern))]
 
 
-def assert_server_reachable(endpoint_url: str, timeout_sec: float = 3.0) -> None:
-    parsed = urlparse(endpoint_url)
-    host = parsed.hostname
-    port = parsed.port
-
-    if host is None:
-        raise RuntimeError(f"Invalid endpoint URL: {endpoint_url}")
-
-    if port is None:
-        port = 443 if parsed.scheme == "https" else 80
-
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout_sec):
-            return
-    except OSError as exc:
-        raise RuntimeError(
-            "Cannot connect to GLM model server at "
-            f"{host}:{port} (from {endpoint_url}). "
-            "Start model_server.py first, for example: "
-            "python model_server.py --host localhost --port 10000 --model-path THUDM/glm-4-voice-9b --dtype bfloat16 --device cuda:0"
-        ) from exc
-
-
-def iter_token_ids(response: requests.Response) -> Iterable[int]:
-    for raw in response.iter_lines():
-        if not raw:
-            continue
-        payload = json.loads(raw)
-        token_id = payload.get("token_id")
-        if token_id is None:
-            continue
-        yield int(token_id)
-
-
 def build_prompt(audio_path: Path, whisper_model: WhisperVQEncoder, feature_extractor: WhisperFeatureExtractor) -> str:
     audio_tokens = extract_speech_token(whisper_model, feature_extractor, [str(audio_path)])[0]
     if len(audio_tokens) == 0:
         raise RuntimeError(f"No audio tokens extracted from: {audio_path}")
-
     token_str = "".join([f"<|audio_{x}|>" for x in audio_tokens])
     return "<|begin_of_audio|>" + token_str + "<|end_of_audio|>"
 
 
-def _decode_hidden_from_payload(payload: dict[str, Any]) -> torch.Tensor:
-    hidden_layers_shape = payload.get("hidden_layers_shape", None)
-    hidden_layers_b64 = payload.get("hidden_layers_b64", "")
+def _sample_top_p(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
+    if temperature <= 0:
+        return torch.argmax(logits, dim=-1)
 
-    if isinstance(hidden_layers_shape, list) and len(hidden_layers_shape) == 3:
-        raw = base64.b64decode(hidden_layers_b64) if hidden_layers_b64 else b""
-        if hidden_layers_shape[0] == 0:
-            return torch.empty((0, 0, 0), dtype=torch.float16)
-        hidden_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(
-            hidden_layers_shape[0], hidden_layers_shape[1], hidden_layers_shape[2]
-        )
-        return torch.from_numpy(hidden_np)
+    logits = logits / max(temperature, 1e-6)
+    probs = torch.softmax(logits, dim=-1)
+    if top_p >= 1.0:
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
-    # Backward compatibility for older server payloads that only return last-layer hidden.
-    hidden_shape = payload.get("hidden_shape", [0, 0])
-    if not isinstance(hidden_shape, list) or len(hidden_shape) != 2:
-        raise RuntimeError("Invalid response: hidden_shape/hidden_layers_shape")
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+    cumsum = torch.cumsum(sorted_probs, dim=-1)
+    keep = cumsum <= top_p
+    keep[..., 0] = True
 
-    hidden_b64 = payload.get("hidden_b64", "")
-    raw = base64.b64decode(hidden_b64) if hidden_b64 else b""
-    if hidden_shape[0] == 0:
-        return torch.empty((0, 0, 0), dtype=torch.float16)
-    hidden_2d_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(hidden_shape[0], hidden_shape[1])
-    hidden_2d = torch.from_numpy(hidden_2d_np)
-    return hidden_2d.unsqueeze(1)
+    filtered = torch.where(keep, sorted_probs, torch.zeros_like(sorted_probs))
+    filtered = filtered / filtered.sum(dim=-1, keepdim=True)
+    sampled_local = torch.multinomial(filtered, num_samples=1)
+    sampled = torch.gather(sorted_indices, -1, sampled_local).squeeze(-1)
+    return sampled
 
 
-def generate_audio(
+def _collect_step_hidden_from_outputs(outputs: Any) -> torch.Tensor | None:
+    hs = getattr(outputs, "hidden_states", None)
+    if not isinstance(hs, (tuple, list)) or len(hs) == 0:
+        return None
+
+    layer_states = list(hs[1:]) if len(hs) > 1 else list(hs)
+    step_layers: list[torch.Tensor] = []
+    for h in layer_states:
+        if not isinstance(h, torch.Tensor) or h.dim() != 3:
+            continue
+        step_layers.append(h[0, -1, :].detach())
+
+    if not step_layers:
+        return None
+    return torch.stack(step_layers, dim=0)
+
+
+def _get_transformer_layers(model: Any):
+    explicit_paths = [
+        ("transformer", "layers"),
+        ("model", "layers"),
+        ("encoder", "layers"),
+        ("decoder", "layers"),
+        ("transformer", "h"),
+        ("model", "h"),
+    ]
+
+    def _get_path(root: Any, path: tuple[str, ...]):
+        cur = root
+        for p in path:
+            cur = getattr(cur, p, None)
+            if cur is None:
+                return None
+        return cur
+
+    best = None
+    best_len = -1
+    for path in explicit_paths:
+        layers = _get_path(model, path)
+        if layers is None or not hasattr(layers, "__len__"):
+            continue
+        n = int(len(layers))
+        if n > best_len:
+            best = layers
+            best_len = n
+
+    if best is not None:
+        return best
+    raise RuntimeError("Unable to locate transformer layers on this model")
+
+
+def _run_local_generation(
     prompt: str,
     args: argparse.Namespace,
+    glm_model: Any,
     glm_tokenizer: Any,
-    audio_decoder: AudioDecoder,
-    inject_layer: int | None = None,
-    steering_map: dict[str, list[float] | None] | None = None,
-    return_hidden: bool = False,
-) -> tuple[torch.Tensor, List[int], torch.Tensor | None]:
-    inputs = f"<|system|>\n{args.system_prompt}<|user|>\n{prompt}<|assistant|>streaming_transcription\n"
+    return_hidden: bool,
+    steering_map: dict[str, list[float] | None] | None,
+    inject_layer: int | None,
+) -> tuple[list[int], torch.Tensor | None]:
+    inputs = glm_tokenizer([prompt], return_tensors="pt").to(args.device)
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs.get("attention_mask", None)
 
-    # Hidden or steering path: do one generation and decode audio from the same token_ids.
-    if return_hidden or steering_map is not None:
-        retries = max(1, int(getattr(args, "hidden_retries", 1)))
-        last_exc: Exception | None = None
-        for attempt in range(1, retries + 1):
-            if steering_map is not None:
-                if inject_layer is None:
-                    raise RuntimeError("inject_layer is required when steering_map is provided")
-                response = requests.post(
-                    args.server_steering_url,
-                    json={
-                        "prompt": inputs,
-                        "temperature": args.temperature,
-                        "top_p": args.top_p,
-                        "max_new_tokens": args.max_new_tokens,
-                        "inject_layer": int(inject_layer),
-                        "steering_map": steering_map,
-                        "return_hidden": bool(return_hidden),
-                    },
-                    timeout=600,
+    step_state = {"step": 0}
+    handle = None
+
+    if steering_map is not None:
+        if inject_layer is None:
+            raise RuntimeError("inject_layer is required when steering_map is provided")
+        layers = _get_transformer_layers(glm_model)
+        num_layers = len(layers)
+        layer_idx = int(inject_layer)
+        if layer_idx < 0:
+            layer_idx = num_layers + layer_idx
+        if layer_idx < 0 or layer_idx >= num_layers:
+            raise RuntimeError(f"inject_layer {inject_layer} out of range [0, {num_layers - 1}]")
+
+        hidden_size = int(getattr(glm_model.config, "hidden_size", 0))
+        smap: dict[int, torch.Tensor] = {}
+        for k, vec in steering_map.items():
+            if vec is None:
+                continue
+            step = int(k)
+            v = torch.tensor(vec, device=args.device, dtype=torch.float32)
+            if hidden_size > 0 and int(v.numel()) != hidden_size:
+                raise RuntimeError(
+                    f"steering vector dim mismatch at step {step}: got {int(v.numel())}, expected {hidden_size}"
                 )
-                response.raise_for_status()
-                payload = response.json()
-                if int(payload.get("error_code", 1)) != 0:
-                    raise RuntimeError(f"generate_with_steering failed: {payload}")
-            else:
-                response = requests.post(
-                    args.server_hidden_url,
-                    json={
-                        "prompt": inputs,
-                        "temperature": args.temperature,
-                        "top_p": args.top_p,
-                        "max_new_tokens": args.max_new_tokens,
-                    },
-                    timeout=600,
-                )
-                response.raise_for_status()
-                payload = response.json()
-                if int(payload.get("error_code", 1)) != 0:
-                    raise RuntimeError(f"generate_with_hidden failed: {payload}")
+            smap[step] = v
 
-            token_ids = payload.get("token_ids", [])
-            if not isinstance(token_ids, list):
-                raise RuntimeError("Invalid response: token_ids is not a list")
+        def _steer_hook(_module, _inputs, output):
+            vec = smap.get(step_state["step"])
+            if vec is None:
+                return output
+            if isinstance(output, tuple):
+                hidden = output[0]
+                if isinstance(hidden, torch.Tensor) and hidden.dim() == 3:
+                    steered = hidden.clone()
+                    steered[:, -1, :] = steered[:, -1, :] + vec.to(steered.dtype)
+                    return (steered, *output[1:])
+                return output
+            if isinstance(output, torch.Tensor) and output.dim() == 3:
+                steered = output.clone()
+                steered[:, -1, :] = steered[:, -1, :] + vec.to(steered.dtype)
+                return steered
+            return output
 
-            hidden_states: torch.Tensor | None = None
+        handle = layers[layer_idx].register_forward_hook(_steer_hook)
+
+    generated: list[int] = []
+    step_hidden: list[torch.Tensor] = []
+    past_key_values = None
+    stop_token_id = glm_tokenizer.convert_tokens_to_ids("<|user|>")
+
+    cur_input_ids = input_ids
+    cur_attention_mask = attention_mask
+
+    try:
+        for step in range(args.max_new_tokens):
+            step_state["step"] = step
+            outputs = glm_model(
+                input_ids=cur_input_ids,
+                attention_mask=cur_attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=return_hidden,
+                return_dict=True,
+            )
+
             if return_hidden:
-                hidden_states = _decode_hidden_from_payload(payload)
+                h = _collect_step_hidden_from_outputs(outputs)
+                if h is not None:
+                    step_hidden.append(h)
 
-            try:
-                tts_speech = decode_audio_from_token_ids([int(x) for x in token_ids], glm_tokenizer, audio_decoder, args.device)
-                return tts_speech, [int(x) for x in token_ids], hidden_states
-            except RuntimeError as ex:
-                if "No audio tokens returned from model" not in str(ex):
-                    raise
-                last_exc = ex
-                if attempt < retries:
-                    print(f"[WARN] hidden generation produced no audio tokens (attempt {attempt}/{retries}), retrying...")
-                    continue
-                raise RuntimeError(f"No audio tokens returned from model after {retries} attempts") from ex
+            logits = outputs.logits[:, -1, :]
+            next_token = _sample_top_p(logits, temperature=args.temperature, top_p=args.top_p)
+            token_id = int(next_token.item())
+            generated.append(token_id)
 
-        if last_exc is not None:
-            raise RuntimeError(f"No audio tokens returned from model after {retries} attempts") from last_exc
-        raise RuntimeError("Hidden generation failed unexpectedly")
+            if token_id == stop_token_id:
+                break
 
-    with torch.no_grad():
-        response = requests.post(
-            args.server_url,
-            data=json.dumps(
-                {
-                    "prompt": inputs,
-                    "temperature": args.temperature,
-                    "top_p": args.top_p,
-                    "max_new_tokens": args.max_new_tokens,
-                }
-            ),
-            stream=True,
-            timeout=600,
-        )
-        response.raise_for_status()
-
-        audio_offset = glm_tokenizer.convert_tokens_to_ids("<|audio_0|>")
-        end_token_id = glm_tokenizer.convert_tokens_to_ids("<|user|>")
-
-        audio_tokens: List[int] = []
-        tts_speechs: List[torch.Tensor] = []
-        tts_mels: List[torch.Tensor] = []
-        prompt_speech_feat = torch.zeros(1, 0, 80, device=args.device)
-        flow_prompt_speech_token = torch.zeros(1, 0, dtype=torch.int64, device=args.device)
-
-        stream_uuid = str(uuid.uuid4())
-        is_finalize = False
-        block_size_list = [25, 50, 100, 150, 200]
-        block_size_idx = 0
-        block_size = block_size_list[block_size_idx]
-
-        for token_id in iter_token_ids(response):
-            if token_id == end_token_id:
-                is_finalize = True
-
-            if token_id >= audio_offset and not is_finalize:
-                audio_tokens.append(token_id - audio_offset)
-
-            if len(audio_tokens) >= block_size or (is_finalize and audio_tokens):
-                if block_size_idx < len(block_size_list) - 1:
-                    block_size_idx += 1
-                    block_size = block_size_list[block_size_idx]
-
-                tts_token = torch.tensor(audio_tokens, device=args.device).unsqueeze(0)
-
-                if tts_mels:
-                    prompt_speech_feat = torch.cat(tts_mels, dim=-1).transpose(1, 2)
-
-                tts_speech, tts_mel = audio_decoder.token2wav(
-                    tts_token,
-                    uuid=stream_uuid,
-                    prompt_token=flow_prompt_speech_token,
-                    prompt_feat=prompt_speech_feat,
-                    finalize=is_finalize,
+            past_key_values = outputs.past_key_values
+            cur_input_ids = next_token.unsqueeze(0)
+            if cur_attention_mask is not None:
+                cur_attention_mask = torch.cat(
+                    [cur_attention_mask, torch.ones((1, 1), device=cur_attention_mask.device, dtype=cur_attention_mask.dtype)],
+                    dim=1,
                 )
-                tts_speechs.append(tts_speech.squeeze())
-                tts_mels.append(tts_mel)
-                flow_prompt_speech_token = torch.cat((flow_prompt_speech_token, tts_token), dim=-1)
-                audio_tokens = []
+    finally:
+        if handle is not None:
+            handle.remove()
 
-        if not tts_speechs:
-            raise RuntimeError("Model returned no audio tokens for this sample")
+    hidden_states: torch.Tensor | None = None
+    if return_hidden:
+        if step_hidden:
+            hidden_states = torch.stack(step_hidden, dim=0).to(torch.float16).cpu()
+        else:
+            hidden_size = int(getattr(glm_model.config, "hidden_size", 0))
+            hidden_states = torch.empty((0, 0, hidden_size), dtype=torch.float16)
 
-        return torch.cat(tts_speechs, dim=-1).cpu(), [], None
-
-    raise RuntimeError("Unreachable: generate_audio did not return")
+    return generated, hidden_states
 
 
 def decode_audio_from_token_ids(
@@ -334,6 +298,46 @@ def decode_audio_from_token_ids(
     return audio_decoder.offline_inference(token_tensor).squeeze(0).cpu()
 
 
+def generate_audio(
+    prompt: str,
+    args: argparse.Namespace,
+    glm_model: Any,
+    glm_tokenizer: Any,
+    audio_decoder: AudioDecoder,
+    inject_layer: int | None = None,
+    steering_map: dict[str, list[float] | None] | None = None,
+    return_hidden: bool = False,
+) -> tuple[torch.Tensor, List[int], torch.Tensor | None]:
+    attempts = max(1, int(args.hidden_retries)) if (return_hidden or steering_map is not None) else 1
+    last_exc: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        token_ids, hidden_states = _run_local_generation(
+            prompt=prompt,
+            args=args,
+            glm_model=glm_model,
+            glm_tokenizer=glm_tokenizer,
+            return_hidden=return_hidden,
+            steering_map=steering_map,
+            inject_layer=inject_layer,
+        )
+        try:
+            tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
+            return tts_speech, token_ids, hidden_states
+        except RuntimeError as ex:
+            if "No audio tokens returned from model" not in str(ex):
+                raise
+            last_exc = ex
+            if attempt < attempts:
+                print(f"[WARN] generation produced no audio tokens (attempt {attempt}/{attempts}), retrying...")
+                continue
+            raise RuntimeError(f"No audio tokens returned from model after {attempts} attempts") from ex
+
+    if last_exc is not None:
+        raise RuntimeError(f"No audio tokens returned from model after {attempts} attempts") from last_exc
+    raise RuntimeError("Generation failed unexpectedly")
+
+
 def count_audio_tokens(token_ids: List[int], glm_tokenizer: Any) -> int:
     n = 0
     token_names = glm_tokenizer.convert_ids_to_tokens(token_ids)
@@ -353,7 +357,6 @@ def build_audio_token_mask(token_ids: List[int], glm_tokenizer: Any) -> List[boo
             mask.append(False)
             break
         mask.append(AUDIO_TOKEN_RE.fullmatch(str(tok)) is not None)
-    # Keep shape aligned with token_ids if no explicit stop token appears.
     if len(mask) < len(token_ids):
         mask.extend([False] * (len(token_ids) - len(mask)))
     return mask
@@ -408,14 +411,12 @@ def save_hidden_payload(
         "output_token_width": 1,
         "times": times,
         "token_time_ranges_sec": token_time_ranges,
-        # Keep legacy key as last-layer hidden for downstream compatibility.
         "hidden_states": last_hidden.float().cpu(),
         "text_hidden_layers": text_hidden_layers.float().cpu(),
         "has_audio_tokens_in_hidden": bool(has_audio_tokens_in_hidden),
         "hidden_audio_token_count": int(hidden_audio_token_count),
         "audio_decode_fallback_used": bool(audio_decode_fallback_used),
         "audio_decode_source": str(audio_decode_source),
-        # Default CE policy: skip samples where hidden tokens carried no audio.
         "ce_exclude_default": bool(not has_audio_tokens_in_hidden),
         "ce_exclude_reason": "hidden_tokens_have_no_audio" if not has_audio_tokens_in_hidden else "",
     }
@@ -445,6 +446,35 @@ def load_steering_map(sample_dir: Path, inject_layer: int) -> dict[str, list[flo
     return layer_payload
 
 
+def _load_local_glm_model(args: argparse.Namespace):
+    quant_cfg = None
+    model_kwargs: dict[str, Any] = {"trust_remote_code": True}
+
+    if args.dtype == "int4":
+        quant_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        model_kwargs["quantization_config"] = quant_cfg
+
+    if args.dtype == "bfloat16":
+        model_kwargs["torch_dtype"] = torch.bfloat16
+    elif args.dtype == "float16":
+        model_kwargs["torch_dtype"] = torch.float16
+    elif args.dtype == "float32":
+        model_kwargs["torch_dtype"] = torch.float32
+
+    if args.device.startswith("cuda"):
+        model_kwargs["device_map"] = {"": 0}
+
+    model = AutoModel.from_pretrained(args.model_path, **model_kwargs).eval()
+    if not args.device.startswith("cuda"):
+        model = model.to(args.device)
+    return model
+
+
 def main() -> None:
     args = parse_args()
 
@@ -454,21 +484,14 @@ def main() -> None:
     if not torch.cuda.is_available() and args.device.startswith("cuda"):
         raise RuntimeError("CUDA device requested but not available")
 
-    required_endpoint = args.server_url
-    if args.inference_with_steering:
-        required_endpoint = args.server_steering_url
-    elif args.save_hidden:
-        required_endpoint = args.server_hidden_url
-
-    print(f"[CHECK] verifying model server: {required_endpoint}")
-    assert_server_reachable(required_endpoint)
-
     flow_config = os.path.join(args.flow_path, "config.yaml")
     flow_checkpoint = os.path.join(args.flow_path, "flow.pt")
     hift_checkpoint = os.path.join(args.flow_path, "hift.pt")
 
-    print("[INIT] loading tokenizer and decoder...")
+    print("[INIT] loading local GLM model, tokenizer, and decoder...")
     glm_tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    glm_model = _load_local_glm_model(args)
+
     whisper_model = WhisperVQEncoder.from_pretrained(args.tokenizer_path).eval().to(args.device)
     feature_extractor = WhisperFeatureExtractor.from_pretrained(args.tokenizer_path)
     audio_decoder = AudioDecoder(
@@ -507,11 +530,13 @@ def main() -> None:
             audio_decode_source = "stream"
             has_audio_tokens_in_hidden = True
             hidden_audio_token_count = 0
+
             if args.inference_with_steering:
                 steering_map = load_steering_map(input_path.parent, int(args.inject_layer))
                 tts_speech, token_ids, hidden_states = generate_audio(
                     prompt,
                     args,
+                    glm_model,
                     glm_tokenizer,
                     audio_decoder,
                     inject_layer=int(args.inject_layer),
@@ -526,6 +551,7 @@ def main() -> None:
                 tts_speech, token_ids, hidden_states = generate_audio(
                     prompt,
                     args,
+                    glm_model,
                     glm_tokenizer,
                     audio_decoder,
                     return_hidden=True,
@@ -534,7 +560,14 @@ def main() -> None:
                 hidden_audio_token_count = count_audio_tokens(token_ids, glm_tokenizer)
                 has_audio_tokens_in_hidden = hidden_audio_token_count > 0
             else:
-                tts_speech, token_ids, hidden_states = generate_audio(prompt, args, glm_tokenizer, audio_decoder)
+                tts_speech, token_ids, hidden_states = generate_audio(
+                    prompt,
+                    args,
+                    glm_model,
+                    glm_tokenizer,
+                    audio_decoder,
+                )
+
             torchaudio.save(str(output_path), tts_speech.unsqueeze(0), 22050, format="wav")
 
             if args.save_hidden:
