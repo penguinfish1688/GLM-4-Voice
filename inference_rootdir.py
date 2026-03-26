@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import numpy as np
 import os
 import re
 import socket
@@ -235,11 +236,10 @@ def generate_tokens_and_hidden(prompt: str, args: argparse.Namespace) -> tuple[L
         if hidden_layers_shape[0] == 0:
             hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
         else:
-            hidden_states = (
-                torch.frombuffer(raw, dtype=torch.float16)
-                .clone()
-                .reshape(hidden_layers_shape[0], hidden_layers_shape[1], hidden_layers_shape[2])
+            hidden_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(
+                hidden_layers_shape[0], hidden_layers_shape[1], hidden_layers_shape[2]
             )
+            hidden_states = torch.from_numpy(hidden_np)
     else:
         # Backward compatibility for older server payloads that only return last-layer hidden.
         hidden_shape = payload.get("hidden_shape", [0, 0])
@@ -251,7 +251,8 @@ def generate_tokens_and_hidden(prompt: str, args: argparse.Namespace) -> tuple[L
         if hidden_shape[0] == 0:
             hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
         else:
-            hidden_2d = torch.frombuffer(raw, dtype=torch.float16).clone().reshape(hidden_shape[0], hidden_shape[1])
+            hidden_2d_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(hidden_shape[0], hidden_shape[1])
+            hidden_2d = torch.from_numpy(hidden_2d_np)
             hidden_states = hidden_2d.unsqueeze(1)
 
     return [int(x) for x in token_ids], hidden_states
@@ -280,6 +281,33 @@ def decode_audio_from_token_ids(
     return audio_decoder.offline_inference(token_tensor).squeeze(0).cpu()
 
 
+def count_audio_tokens(token_ids: List[int], glm_tokenizer: Any) -> int:
+    audio_offset = int(glm_tokenizer.convert_tokens_to_ids("<|audio_0|>"))
+    end_token_id = int(glm_tokenizer.convert_tokens_to_ids("<|user|>"))
+    n = 0
+    for token_id in token_ids:
+        if token_id == end_token_id:
+            break
+        if token_id >= audio_offset:
+            n += 1
+    return int(n)
+
+
+def build_audio_token_mask(token_ids: List[int], glm_tokenizer: Any) -> List[bool]:
+    audio_offset = int(glm_tokenizer.convert_tokens_to_ids("<|audio_0|>"))
+    end_token_id = int(glm_tokenizer.convert_tokens_to_ids("<|user|>"))
+    mask: List[bool] = []
+    for token_id in token_ids:
+        if token_id == end_token_id:
+            mask.append(False)
+            break
+        mask.append(bool(token_id >= audio_offset))
+    # Keep shape aligned with token_ids if no explicit stop token appears.
+    if len(mask) < len(token_ids):
+        mask.extend([False] * (len(token_ids) - len(mask)))
+    return mask
+
+
 def save_hidden_payload(
     hidden_path: Path,
     input_path: Path,
@@ -287,6 +315,10 @@ def save_hidden_payload(
     token_ids: List[int],
     hidden_states: torch.Tensor,
     glm_tokenizer: Any,
+    has_audio_tokens_in_hidden: bool,
+    hidden_audio_token_count: int,
+    audio_decode_fallback_used: bool,
+    audio_decode_source: str,
 ) -> None:
     out_token_ids = torch.tensor(token_ids, dtype=torch.long).view(-1, 1)
     in_token_ids = torch.full_like(out_token_ids, fill_value=-1)
@@ -311,12 +343,14 @@ def save_hidden_payload(
         last_hidden = torch.empty((t, 0), dtype=text_hidden_layers.dtype)
 
     payload = {
-        "schema_version": 1,
+        "schema_version": 6,
         "input_wav": str(input_path),
         "output_wav": str(output_path),
+        "output_text": "",
         "frame_rate": float(frame_rate_hz),
         "token_ids": out_token_ids.view(-1),
         "token_names": glm_tokenizer.convert_ids_to_tokens(token_ids),
+        "hidden_audio_token_mask": torch.tensor(build_audio_token_mask(token_ids, glm_tokenizer), dtype=torch.bool),
         "input_token_ids": in_token_ids,
         "input_token_width": 1,
         "output_token_ids": out_token_ids,
@@ -326,6 +360,13 @@ def save_hidden_payload(
         # Keep legacy key as last-layer hidden for downstream compatibility.
         "hidden_states": last_hidden.float().cpu(),
         "text_hidden_layers": text_hidden_layers.float().cpu(),
+        "has_audio_tokens_in_hidden": bool(has_audio_tokens_in_hidden),
+        "hidden_audio_token_count": int(hidden_audio_token_count),
+        "audio_decode_fallback_used": bool(audio_decode_fallback_used),
+        "audio_decode_source": str(audio_decode_source),
+        # Default CE policy: skip samples where hidden tokens carried no audio.
+        "ce_exclude_default": bool(not has_audio_tokens_in_hidden),
+        "ce_exclude_reason": "hidden_tokens_have_no_audio" if not has_audio_tokens_in_hidden else "",
     }
     torch.save(payload, hidden_path)
 
@@ -391,11 +432,10 @@ def generate_tokens_with_steering(
             if hidden_layers_shape[0] == 0:
                 hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
             else:
-                hidden_states = (
-                    torch.frombuffer(raw, dtype=torch.float16)
-                    .clone()
-                    .reshape(hidden_layers_shape[0], hidden_layers_shape[1], hidden_layers_shape[2])
+                hidden_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(
+                    hidden_layers_shape[0], hidden_layers_shape[1], hidden_layers_shape[2]
                 )
+                hidden_states = torch.from_numpy(hidden_np)
         else:
             hidden_shape = payload.get("hidden_shape", [0, 0])
             if not isinstance(hidden_shape, list) or len(hidden_shape) != 2:
@@ -406,7 +446,8 @@ def generate_tokens_with_steering(
             if hidden_shape[0] == 0:
                 hidden_states = torch.empty((0, 0, 0), dtype=torch.float16)
             else:
-                hidden_2d = torch.frombuffer(raw, dtype=torch.float16).clone().reshape(hidden_shape[0], hidden_shape[1])
+                hidden_2d_np = np.frombuffer(raw, dtype=np.float16).copy().reshape(hidden_shape[0], hidden_shape[1])
+                hidden_2d = torch.from_numpy(hidden_2d_np)
                 hidden_states = hidden_2d.unsqueeze(1)
 
     return [int(x) for x in token_ids], hidden_states
@@ -470,6 +511,10 @@ def main() -> None:
 
         try:
             prompt = build_prompt(input_path, whisper_model, feature_extractor)
+            audio_decode_fallback_used = False
+            audio_decode_source = "hidden_tokens"
+            has_audio_tokens_in_hidden = True
+            hidden_audio_token_count = 0
             if args.inference_with_steering:
                 steering_map = load_steering_map(input_path.parent, int(args.inject_layer))
                 token_ids, hidden_states = generate_tokens_with_steering(
@@ -478,10 +523,30 @@ def main() -> None:
                     inject_layer=int(args.inject_layer),
                     steering_map=steering_map,
                 )
-                tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
+                hidden_audio_token_count = count_audio_tokens(token_ids, glm_tokenizer)
+                has_audio_tokens_in_hidden = hidden_audio_token_count > 0
+                try:
+                    tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
+                except RuntimeError as ex:
+                    if "No audio tokens returned from model" not in str(ex):
+                        raise
+                    print("[WARN] steering hidden path returned no audio tokens, fallback to stream decode")
+                    audio_decode_fallback_used = True
+                    audio_decode_source = "stream_fallback"
+                    tts_speech = generate_audio(prompt, args, glm_tokenizer, audio_decoder)
             elif args.save_hidden:
                 token_ids, hidden_states = generate_tokens_and_hidden(prompt, args)
-                tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
+                hidden_audio_token_count = count_audio_tokens(token_ids, glm_tokenizer)
+                has_audio_tokens_in_hidden = hidden_audio_token_count > 0
+                try:
+                    tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
+                except RuntimeError as ex:
+                    if "No audio tokens returned from model" not in str(ex):
+                        raise
+                    print("[WARN] hidden path returned no audio tokens, fallback to stream decode")
+                    audio_decode_fallback_used = True
+                    audio_decode_source = "stream_fallback"
+                    tts_speech = generate_audio(prompt, args, glm_tokenizer, audio_decoder)
             else:
                 tts_speech = generate_audio(prompt, args, glm_tokenizer, audio_decoder)
             torchaudio.save(str(output_path), tts_speech.unsqueeze(0), 22050, format="wav")
@@ -496,12 +561,23 @@ def main() -> None:
                     token_ids=token_ids,
                     hidden_states=hidden_states,
                     glm_tokenizer=glm_tokenizer,
+                    has_audio_tokens_in_hidden=has_audio_tokens_in_hidden,
+                    hidden_audio_token_count=hidden_audio_token_count,
+                    audio_decode_fallback_used=audio_decode_fallback_used,
+                    audio_decode_source=audio_decode_source,
                 )
                 hs = tuple(int(x) for x in hidden_states.shape)
                 if args.inference_with_steering:
-                    print(f"[OK] {output_path} + {hidden_path} hidden_shape={hs} (steered layer={int(args.inject_layer)})")
+                    print(
+                        f"[OK] {output_path} + {hidden_path} hidden_shape={hs} "
+                        f"audio_in_hidden={hidden_audio_token_count} fallback={audio_decode_fallback_used} "
+                        f"(steered layer={int(args.inject_layer)})"
+                    )
                 else:
-                    print(f"[OK] {output_path} + {hidden_path} hidden_shape={hs}")
+                    print(
+                        f"[OK] {output_path} + {hidden_path} hidden_shape={hs} "
+                        f"audio_in_hidden={hidden_audio_token_count} fallback={audio_decode_fallback_used}"
+                    )
             else:
                 if args.inference_with_steering:
                     print(f"[OK] {output_path} (steered layer={int(args.inject_layer)})")

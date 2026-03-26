@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +31,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="interrupt_start",
         help="Anchor key in input_timing.json (e.g., interrupt_start or question_start)",
+    )
+    ap.add_argument(
+        "--include-ce-excluded",
+        action="store_true",
+        help="Include samples marked with ce_exclude_default=true in output_hidden.pt",
+    )
+    ap.add_argument(
+        "--allow-partial-layers",
+        action="store_true",
+        help="Allow plotting when some samples have different/missing layer counts",
     )
     return ap.parse_args()
 
@@ -334,18 +344,22 @@ def main() -> None:
 
     print("[INIT] loading GLM model for CE plotting...")
     model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True, device_map={"": 0}).eval()
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    audio_offset = int(tokenizer.convert_tokens_to_ids("<|audio_0|>"))
     lm_head, norm_layer, head_name = _get_lm_head_and_norm(model)
     print(f"[INIT] using output head: {head_name}")
 
     ok = 0
     total = 0
     per_layer_records: Dict[int, List[Dict[str, Any]]] = {}
+    expected_num_layers: int | None = None
     for hp in paths:
         total += 1
         try:
             payload = torch.load(hp, map_location="cpu", weights_only=False)
             if not isinstance(payload, dict):
                 raise TypeError(f"payload is {type(payload).__name__}, expected dict")
+
             if "token_ids" not in payload:
                 raise KeyError("Missing key 'token_ids' in output_hidden.pt")
 
@@ -355,6 +369,17 @@ def main() -> None:
             hidden = payload["text_hidden_layers"]
             if not isinstance(hidden, torch.Tensor) or hidden.ndim != 3:
                 raise ValueError(f"Expected text_hidden_layers [T,L,D], got {type(hidden).__name__} {getattr(hidden, 'shape', None)}")
+
+            cur_layers = int(hidden.shape[1])
+            if expected_num_layers is None:
+                expected_num_layers = cur_layers
+                print(f"[INIT] expected hidden layers: {expected_num_layers}")
+            elif cur_layers != expected_num_layers and not args.allow_partial_layers:
+                print(
+                    f"[SKIP] {hp.parent} (layer mismatch: got {cur_layers}, expected {expected_num_layers}; "
+                    "use --allow-partial-layers to override)"
+                )
+                continue
 
             token_ids = _to_token_ids(payload["token_ids"])
             if token_ids.numel() < 3:
@@ -380,6 +405,15 @@ def main() -> None:
                     output_targets = token_ids
             else:
                 output_targets = token_ids
+
+            if "hidden_audio_token_mask" in payload:
+                mask_raw = payload["hidden_audio_token_mask"]
+                if isinstance(mask_raw, torch.Tensor):
+                    audio_mask = mask_raw.detach().cpu().bool().view(-1)
+                else:
+                    audio_mask = torch.tensor(mask_raw, dtype=torch.bool).view(-1)
+            else:
+                audio_mask = (token_ids >= audio_offset)
 
             t, num_layers, _ = hidden.shape
             for lv in range(num_layers):
@@ -407,6 +441,13 @@ def main() -> None:
                 line2 = line2[:n]
                 if n == 0:
                     continue
+
+                audio_mask_n = audio_mask[:n].bool()
+                # Keep timeline positions: mark non-audio token CE as NaN instead of dropping rows.
+                line1 = line1.float()
+                line2 = line2.float()
+                line1[~audio_mask_n] = float("nan")
+                line2[~audio_mask_n] = float("nan")
 
                 times = maybe_get_times(payload, n)
                 ratio = (line1 / line2.clamp_min(1e-6)).tolist()
@@ -442,6 +483,14 @@ def main() -> None:
             ok += 1
         except Exception as exc:
             print(f"[SKIP] {hp}: {exc}")
+
+    if expected_num_layers is not None and not args.allow_partial_layers:
+        missing_layers = [lv for lv in range(expected_num_layers) if lv not in per_layer_records]
+        if missing_layers:
+            raise RuntimeError(
+                f"Missing CE records for layers {missing_layers}. "
+                "Some samples likely had invalid/short payloads; rerun inference or use --allow-partial-layers."
+            )
 
     if per_layer_records:
         save_anchored_heatmaps(
