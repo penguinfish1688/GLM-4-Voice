@@ -13,6 +13,7 @@ python model_server.py --host localhost --model-path THUDM/glm-4-voice-9b --port
 import argparse
 import json
 import base64
+import traceback
 from typing import Any
 import torch.nn as nn
 
@@ -275,6 +276,24 @@ class ModelWorker:
             return None
         return torch.stack(step_layers, dim=0)
 
+    @staticmethod
+    def _collect_step_hidden_from_outputs(outputs: Any) -> torch.Tensor | None:
+        hs = getattr(outputs, "hidden_states", None)
+        if not isinstance(hs, (tuple, list)) or len(hs) == 0:
+            return None
+
+        # Skip embedding entry when available.
+        layer_states = list(hs[1:]) if len(hs) > 1 else list(hs)
+        step_layers: list[torch.Tensor] = []
+        for h in layer_states:
+            if not isinstance(h, torch.Tensor) or h.dim() != 3:
+                continue
+            step_layers.append(h[0, -1, :].detach())
+
+        if not step_layers:
+            return None
+        return torch.stack(step_layers, dim=0)
+
     @torch.inference_mode()
     def generate_stream(self, params):
         tokenizer, model = self.glm_tokenizer, self.glm_model
@@ -327,57 +346,52 @@ class ModelWorker:
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask", None)
 
-        layers = self._get_transformer_layers(model)
-        latest_hidden, cap_handles = self._register_layer_capture_hooks(layers)
-
         generated: list[int] = []
         step_hidden: list[torch.Tensor] = []
         past_key_values = None
         stop_token_id = tokenizer.convert_tokens_to_ids("<|user|>")
 
-        try:
-            cur_input_ids = input_ids
-            cur_attention_mask = attention_mask
+        cur_input_ids = input_ids
+        cur_attention_mask = attention_mask
 
-            for _step in range(max_new_tokens):
-                outputs = model(
-                    input_ids=cur_input_ids,
-                    attention_mask=cur_attention_mask,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    return_dict=True,
+        for _step in range(max_new_tokens):
+            outputs = model(
+                input_ids=cur_input_ids,
+                attention_mask=cur_attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+            step_h = self._collect_step_hidden_from_outputs(outputs)
+            if step_h is not None:
+                step_hidden.append(step_h)
+
+            logits = outputs.logits[:, -1, :]
+            next_token = self._sample_top_p(logits, temperature=temperature, top_p=top_p)
+            token_id = int(next_token.item())
+            generated.append(token_id)
+
+            if token_id == stop_token_id:
+                break
+
+            past_key_values = outputs.past_key_values
+            cur_input_ids = next_token.unsqueeze(0)
+            if cur_attention_mask is not None:
+                cur_attention_mask = torch.cat(
+                    [
+                        cur_attention_mask,
+                        torch.ones((1, 1), device=cur_attention_mask.device, dtype=cur_attention_mask.dtype),
+                    ],
+                    dim=1,
                 )
-
-                step_h = self._collect_step_layer_hidden(latest_hidden)
-                if step_h is not None:
-                    step_hidden.append(step_h)
-
-                logits = outputs.logits[:, -1, :]
-                next_token = self._sample_top_p(logits, temperature=temperature, top_p=top_p)
-                token_id = int(next_token.item())
-                generated.append(token_id)
-
-                if token_id == stop_token_id:
-                    break
-
-                past_key_values = outputs.past_key_values
-                cur_input_ids = next_token.unsqueeze(0)
-                if cur_attention_mask is not None:
-                    cur_attention_mask = torch.cat(
-                        [
-                            cur_attention_mask,
-                            torch.ones((1, 1), device=cur_attention_mask.device, dtype=cur_attention_mask.dtype),
-                        ],
-                        dim=1,
-                    )
-        finally:
-            for h in cap_handles:
-                h.remove()
 
         if step_hidden:
             hidden_layers = torch.stack(step_hidden, dim=0).to(torch.float16).cpu()
         else:
-            hidden_layers = torch.empty((0, int(len(layers)), int(getattr(model.config, "hidden_size", 0))), dtype=torch.float16)
+            hidden_size = int(getattr(model.config, "hidden_size", 0))
+            hidden_layers = torch.empty((0, 0, hidden_size), dtype=torch.float16)
 
         hidden_payload = self._pack_hidden_layers_tensor(hidden_layers)
 
@@ -392,6 +406,7 @@ class ModelWorker:
             return self.generate_with_hidden(params)
         except Exception as e:
             print("Caught Unknown Error", e)
+            traceback.print_exc()
             return {
                 "token_ids": [],
                 "hidden_dtype": "float16",
@@ -464,10 +479,6 @@ class ModelWorker:
             return output
 
         handle = layers[inject_layer].register_forward_hook(_steer_hook)
-        latest_hidden = None
-        cap_handles = []
-        if return_hidden:
-            latest_hidden, cap_handles = self._register_layer_capture_hooks(layers)
 
         generated: list[int] = []
         step_hidden: list[torch.Tensor] = []
@@ -485,11 +496,12 @@ class ModelWorker:
                     attention_mask=cur_attention_mask,
                     past_key_values=past_key_values,
                     use_cache=True,
+                    output_hidden_states=return_hidden,
                     return_dict=True,
                 )
 
-                if return_hidden and latest_hidden is not None:
-                    step_h = self._collect_step_layer_hidden(latest_hidden)
+                if return_hidden:
+                    step_h = self._collect_step_hidden_from_outputs(outputs)
                     if step_h is not None:
                         step_hidden.append(step_h)
 
@@ -511,8 +523,6 @@ class ModelWorker:
 
         finally:
             handle.remove()
-            for h in cap_handles:
-                h.remove()
 
         payload = {
             "token_ids": generated,
@@ -533,6 +543,7 @@ class ModelWorker:
             return self.generate_with_steering(params)
         except Exception as e:
             print("Caught Unknown Error", e)
+            traceback.print_exc()
             return {
                 "token_ids": [],
                 "error_code": 1,
