@@ -2,13 +2,14 @@
 """
 Batch inference for GLM-4-Voice on dataset layout: root_dir/*/input.wav.
 
-This script runs GLM generation locally in a single process (no model_server).
+This script runs GLM inference in client mode against model_server endpoints.
 For each input.wav, it writes output.wav and optionally output_hidden.pt.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from threading import Thread
 from typing import Any, List
 
 import numpy as np
+import requests
 import torch
 import torchaudio
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, WhisperFeatureExtractor
@@ -116,6 +118,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32", "int4"])
     parser.add_argument("--tokenizer-path", default="THUDM/glm-4-voice-tokenizer", help="Speech tokenizer path")
     parser.add_argument("--flow-path", default="./glm-4-voice-decoder", help="Decoder checkpoint directory")
+    parser.add_argument("--server-url", default="http://localhost:10000/generate_stream", help="Model server stream endpoint")
+    parser.add_argument(
+        "--server-hidden-url",
+        default="http://localhost:10000/generate_with_hidden",
+        help="Model server hidden endpoint",
+    )
+    parser.add_argument(
+        "--server-steering-url",
+        default="http://localhost:10000/generate_with_steering",
+        help="Model server steering endpoint",
+    )
+    parser.add_argument("--request-timeout", type=float, default=600.0, help="HTTP timeout for server requests")
 
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.8)
@@ -189,6 +203,47 @@ def _sample_top_p(logits: torch.Tensor, temperature: float, top_p: float) -> tor
     sampled_local = torch.multinomial(filtered, num_samples=1)
     sampled = torch.gather(sorted_indices, -1, sampled_local).squeeze(-1)
     return sampled
+
+
+def iter_token_ids(response: requests.Response) -> List[int]:
+    ids: List[int] = []
+    for raw in response.iter_lines():
+        if not raw:
+            continue
+        payload = json.loads(raw)
+        if isinstance(payload, dict) and int(payload.get("error_code", 0)) != 0:
+            raise RuntimeError(f"Server stream error: {payload}")
+        token_id = payload.get("token_id") if isinstance(payload, dict) else None
+        if token_id is None:
+            continue
+        ids.append(int(token_id))
+    return ids
+
+
+def _decode_hidden_from_payload(payload: dict) -> torch.Tensor:
+    hidden_dtype = str(payload.get("hidden_dtype", "float16"))
+    shape = payload.get("hidden_layers_shape", None)
+    b64 = payload.get("hidden_layers_b64", None)
+
+    if shape is None or b64 is None:
+        shape_2d = payload.get("hidden_shape", [0, 0])
+        b64_2d = str(payload.get("hidden_b64", ""))
+        if isinstance(shape_2d, list) and len(shape_2d) == 2 and b64_2d:
+            raw_2d = np.frombuffer(base64.b64decode(b64_2d), dtype=np.float16)
+            expected_2d = int(np.prod(shape_2d))
+            if expected_2d > 0 and raw_2d.size == expected_2d:
+                t2 = torch.from_numpy(raw_2d.reshape(shape_2d).copy()).to(torch.float16)
+                return t2.unsqueeze(1)
+        return torch.empty((0, 0, 0), dtype=torch.float16)
+
+    if hidden_dtype != "float16":
+        raise RuntimeError(f"Unsupported hidden dtype from server: {hidden_dtype}")
+
+    raw = np.frombuffer(base64.b64decode(str(b64)), dtype=np.float16)
+    expected = int(np.prod(shape)) if isinstance(shape, list) else 0
+    if expected <= 0 or raw.size != expected:
+        raise RuntimeError(f"Invalid hidden payload size: got={raw.size}, expected={expected}, shape={shape}")
+    return torch.from_numpy(raw.reshape(shape).copy()).to(torch.float16)
 
 
 def _collect_step_hidden_from_outputs(outputs: Any) -> torch.Tensor | None:
@@ -499,16 +554,69 @@ def generate_audio(
     steering_map: dict[str, list[float] | None] | None = None,
     return_hidden: bool = False,
 ) -> tuple[torch.Tensor, List[int], torch.Tensor | None]:
-    # Use the server-equivalent streamer path as the primary route.
-    token_ids, hidden_states = _run_generate_streamer(
-        prompt=prompt,
-        args=args,
-        glm_model=glm_model,
-        glm_tokenizer=glm_tokenizer,
-        return_hidden=return_hidden,
-        steering_map=steering_map,
-        inject_layer=inject_layer,
-    )
+    del glm_model  # In server mode generation is remote; keep signature stable.
+
+    token_ids: List[int]
+    hidden_states: torch.Tensor | None = None
+
+    if steering_map is not None:
+        if inject_layer is None:
+            raise RuntimeError("inject_layer is required when steering_map is provided")
+        response = requests.post(
+            args.server_steering_url,
+            json={
+                "prompt": prompt,
+                "temperature": float(args.temperature),
+                "top_p": float(args.top_p),
+                "max_new_tokens": int(args.max_new_tokens),
+                "inject_layer": int(inject_layer),
+                "steering_map": steering_map,
+                "return_hidden": bool(return_hidden),
+            },
+            timeout=float(args.request_timeout),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if int(payload.get("error_code", 1)) != 0:
+            raise RuntimeError(f"generate_with_steering failed: {payload}")
+        token_ids = [int(x) for x in payload.get("token_ids", [])]
+        if return_hidden:
+            hidden_states = _decode_hidden_from_payload(payload)
+    elif return_hidden:
+        response = requests.post(
+            args.server_hidden_url,
+            json={
+                "prompt": prompt,
+                "temperature": float(args.temperature),
+                "top_p": float(args.top_p),
+                "max_new_tokens": int(args.max_new_tokens),
+            },
+            timeout=float(args.request_timeout),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if int(payload.get("error_code", 1)) != 0:
+            raise RuntimeError(f"generate_with_hidden failed: {payload}")
+        token_ids = [int(x) for x in payload.get("token_ids", [])]
+        hidden_states = _decode_hidden_from_payload(payload)
+    else:
+        response = requests.post(
+            args.server_url,
+            data=json.dumps(
+                {
+                    "prompt": prompt,
+                    "temperature": float(args.temperature),
+                    "top_p": float(args.top_p),
+                    "max_new_tokens": int(args.max_new_tokens),
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+            stream=True,
+            timeout=float(args.request_timeout),
+        )
+        response.raise_for_status()
+        token_ids = iter_token_ids(response)
+
     tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
     return tts_speech, token_ids, hidden_states
 
@@ -660,9 +768,9 @@ def main() -> None:
     flow_checkpoint = os.path.join(args.flow_path, "flow.pt")
     hift_checkpoint = os.path.join(args.flow_path, "hift.pt")
 
-    print("[INIT] loading local GLM model, tokenizer, and decoder...")
+    print("[INIT] loading tokenizer + decoder (generation via model_server)...")
     glm_tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    glm_model = _load_local_glm_model(args)
+    glm_model = None
 
     whisper_model = WhisperVQEncoder.from_pretrained(args.tokenizer_path).eval().to(args.asr_device)
     feature_extractor = WhisperFeatureExtractor.from_pretrained(args.tokenizer_path)
