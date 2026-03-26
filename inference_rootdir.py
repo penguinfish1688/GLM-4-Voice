@@ -14,12 +14,15 @@ import os
 import re
 from glob import glob
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 from typing import Any, List
 
 import numpy as np
 import torch
 import torchaudio
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, WhisperFeatureExtractor
+from transformers.generation.streamers import BaseStreamer
 
 from flow_inference import AudioDecoder
 from speech_tokenizer.modeling_whisper import WhisperVQEncoder
@@ -27,6 +30,40 @@ from speech_tokenizer.utils import extract_speech_token
 
 
 AUDIO_TOKEN_RE = re.compile(r"<\|audio_(\d+)\|>")
+
+
+class TokenStreamer(BaseStreamer):
+    def __init__(self, skip_prompt: bool = False, timeout: float | None = None):
+        self.skip_prompt = skip_prompt
+        self.timeout = timeout
+        self.token_queue: Queue = Queue()
+        self.stop_signal = None
+        self.next_tokens_are_prompt = True
+
+    def put(self, value):
+        if len(value.shape) > 1 and value.shape[0] > 1:
+            raise ValueError("TokenStreamer only supports batch size 1")
+        elif len(value.shape) > 1:
+            value = value[0]
+
+        if self.skip_prompt and self.next_tokens_are_prompt:
+            self.next_tokens_are_prompt = False
+            return
+
+        for token in value.tolist():
+            self.token_queue.put(int(token))
+
+    def end(self):
+        self.token_queue.put(self.stop_signal)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        value = self.token_queue.get(timeout=self.timeout)
+        if value == self.stop_signal:
+            raise StopIteration()
+        return int(value)
 
 
 def _get_audio_offset_id(glm_tokenizer: Any) -> int:
@@ -321,6 +358,122 @@ def _run_local_generation(
     return generated, hidden_states
 
 
+def _run_generate_fallback(
+    prompt: str,
+    args: argparse.Namespace,
+    glm_model: Any,
+    glm_tokenizer: Any,
+    return_hidden: bool,
+    steering_map: dict[str, list[float] | None] | None,
+    inject_layer: int | None,
+) -> tuple[list[int], torch.Tensor | None]:
+    inputs = glm_tokenizer([prompt], return_tensors="pt").to(args.device)
+    prompt_len = int(inputs["input_ids"].shape[1])
+
+    step_state = {"step": 0}
+    handle = None
+
+    if steering_map is not None:
+        if inject_layer is None:
+            raise RuntimeError("inject_layer is required when steering_map is provided")
+        layers = _get_transformer_layers(glm_model)
+        num_layers = len(layers)
+        layer_idx = int(inject_layer)
+        if layer_idx < 0:
+            layer_idx = num_layers + layer_idx
+        if layer_idx < 0 or layer_idx >= num_layers:
+            raise RuntimeError(f"inject_layer {inject_layer} out of range [0, {num_layers - 1}]")
+
+        hidden_size = int(getattr(glm_model.config, "hidden_size", 0))
+        smap: dict[int, torch.Tensor] = {}
+        for k, vec in steering_map.items():
+            if vec is None:
+                continue
+            step = int(k)
+            v = torch.tensor(vec, device=args.device, dtype=torch.float32)
+            if hidden_size > 0 and int(v.numel()) != hidden_size:
+                raise RuntimeError(
+                    f"steering vector dim mismatch at step {step}: got {int(v.numel())}, expected {hidden_size}"
+                )
+            smap[step] = v
+
+        def _steer_hook(_module, _inputs, output):
+            vec = smap.get(step_state["step"])
+            step_state["step"] += 1
+            if vec is None:
+                return output
+            if isinstance(output, tuple):
+                hidden = output[0]
+                if isinstance(hidden, torch.Tensor) and hidden.dim() == 3:
+                    steered = hidden.clone()
+                    steered[:, -1, :] = steered[:, -1, :] + vec.to(steered.dtype)
+                    return (steered, *output[1:])
+                return output
+            if isinstance(output, torch.Tensor) and output.dim() == 3:
+                steered = output.clone()
+                steered[:, -1, :] = steered[:, -1, :] + vec.to(steered.dtype)
+                return steered
+            return output
+
+        handle = layers[layer_idx].register_forward_hook(_steer_hook)
+
+    try:
+        with torch.inference_mode():
+            # Mirror model_server.generate_stream behavior for fallback.
+            streamer = TokenStreamer(skip_prompt=True, timeout=120)
+            thread = Thread(
+                target=glm_model.generate,
+                kwargs=dict(
+                    **inputs,
+                    max_new_tokens=int(args.max_new_tokens),
+                    temperature=float(args.temperature),
+                    top_p=float(args.top_p),
+                    streamer=streamer,
+                ),
+            )
+            thread.start()
+
+            generated_ids: list[int] = []
+            for token_id in streamer:
+                generated_ids.append(int(token_id))
+            thread.join()
+
+            hidden_states: torch.Tensor | None = None
+            if return_hidden:
+                if generated_ids:
+                    generated_tensor = torch.tensor(generated_ids, dtype=torch.long, device=args.device).unsqueeze(0)
+                    sequences = torch.cat([inputs["input_ids"], generated_tensor], dim=1)
+                else:
+                    sequences = inputs["input_ids"]
+
+                fwd = glm_model(
+                    input_ids=sequences,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                hs = getattr(fwd, "hidden_states", None)
+                if not isinstance(hs, (tuple, list)) or len(hs) == 0:
+                    raise RuntimeError("Model did not return hidden_states in fallback path")
+
+                layer_states = list(hs[1:]) if len(hs) > 1 else list(hs)
+                per_layer: list[torch.Tensor] = []
+                for h in layer_states:
+                    if not isinstance(h, torch.Tensor) or h.dim() != 3:
+                        continue
+                    per_layer.append(h[0, prompt_len:, :].detach().to(torch.float16).cpu())
+
+                if per_layer:
+                    hidden_states = torch.stack(per_layer, dim=1)
+                else:
+                    hidden_size = int(getattr(glm_model.config, "hidden_size", 0))
+                    hidden_states = torch.empty((0, 0, hidden_size), dtype=torch.float16)
+
+            return [int(x) for x in generated_ids], hidden_states
+    finally:
+        if handle is not None:
+            handle.remove()
+
+
 def decode_audio_from_token_ids(
     token_ids: List[int],
     glm_tokenizer: Any,
@@ -369,11 +522,27 @@ def generate_audio(
             if attempt < attempts:
                 print(f"[WARN] generation produced no audio tokens (attempt {attempt}/{attempts}), retrying...")
                 continue
-            raise RuntimeError(f"No audio tokens returned from model after {attempts} attempts") from ex
+            print("[WARN] step-wise generation exhausted, switching to official model.generate fallback...")
 
-    if last_exc is not None:
-        raise RuntimeError(f"No audio tokens returned from model after {attempts} attempts") from last_exc
-    raise RuntimeError("Generation failed unexpectedly")
+    # Final fallback: match official generation behavior from model_server/web_demo path.
+    token_ids, hidden_states = _run_generate_fallback(
+        prompt=prompt,
+        args=args,
+        glm_model=glm_model,
+        glm_tokenizer=glm_tokenizer,
+        return_hidden=return_hidden,
+        steering_map=steering_map,
+        inject_layer=inject_layer,
+    )
+    try:
+        tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
+    except RuntimeError as ex:
+        if "No audio tokens returned from model" in str(ex):
+            raise RuntimeError(
+                f"No audio tokens returned from model after {attempts} step-wise attempts and model.generate fallback"
+            ) from ex
+        raise
+    return tts_speech, token_ids, hidden_states
 
 
 def count_audio_tokens(token_ids: List[int], glm_tokenizer: Any) -> int:
