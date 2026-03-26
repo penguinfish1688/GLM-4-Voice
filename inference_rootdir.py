@@ -59,6 +59,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.8)
     parser.add_argument("--max-new-tokens", type=int, default=2000)
     parser.add_argument(
+        "--oom-retry-scales",
+        default="0.75,0.5,0.35",
+        help="Comma-separated scales to retry max_new_tokens after CUDA OOM (example: 0.75,0.5)",
+    )
+    parser.add_argument(
         "--hidden-retries",
         type=int,
         default=3,
@@ -126,7 +131,8 @@ def _collect_step_hidden_from_outputs(outputs: Any) -> torch.Tensor | None:
     for h in layer_states:
         if not isinstance(h, torch.Tensor) or h.dim() != 3:
             continue
-        step_layers.append(h[0, -1, :].detach())
+        # Keep only last-token hidden and move to CPU immediately to avoid GPU growth.
+        step_layers.append(h[0, -1, :].detach().to(torch.float16).cpu())
 
     if not step_layers:
         return None
@@ -235,37 +241,38 @@ def _run_local_generation(
     cur_attention_mask = attention_mask
 
     try:
-        for step in range(args.max_new_tokens):
-            step_state["step"] = step
-            outputs = glm_model(
-                input_ids=cur_input_ids,
-                attention_mask=cur_attention_mask,
-                past_key_values=past_key_values,
-                use_cache=True,
-                output_hidden_states=return_hidden,
-                return_dict=True,
-            )
-
-            if return_hidden:
-                h = _collect_step_hidden_from_outputs(outputs)
-                if h is not None:
-                    step_hidden.append(h)
-
-            logits = outputs.logits[:, -1, :]
-            next_token = _sample_top_p(logits, temperature=args.temperature, top_p=args.top_p)
-            token_id = int(next_token.item())
-            generated.append(token_id)
-
-            if token_id == stop_token_id:
-                break
-
-            past_key_values = outputs.past_key_values
-            cur_input_ids = next_token.unsqueeze(0)
-            if cur_attention_mask is not None:
-                cur_attention_mask = torch.cat(
-                    [cur_attention_mask, torch.ones((1, 1), device=cur_attention_mask.device, dtype=cur_attention_mask.dtype)],
-                    dim=1,
+        with torch.inference_mode():
+            for step in range(args.max_new_tokens):
+                step_state["step"] = step
+                outputs = glm_model(
+                    input_ids=cur_input_ids,
+                    attention_mask=cur_attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    output_hidden_states=return_hidden,
+                    return_dict=True,
                 )
+
+                if return_hidden:
+                    h = _collect_step_hidden_from_outputs(outputs)
+                    if h is not None:
+                        step_hidden.append(h)
+
+                logits = outputs.logits[:, -1, :]
+                next_token = _sample_top_p(logits, temperature=args.temperature, top_p=args.top_p)
+                token_id = int(next_token.item())
+                generated.append(token_id)
+
+                if token_id == stop_token_id:
+                    break
+
+                past_key_values = outputs.past_key_values
+                cur_input_ids = next_token.unsqueeze(0)
+                if cur_attention_mask is not None:
+                    cur_attention_mask = torch.cat(
+                        [cur_attention_mask, torch.ones((1, 1), device=cur_attention_mask.device, dtype=cur_attention_mask.dtype)],
+                        dim=1,
+                    )
     finally:
         if handle is not None:
             handle.remove()
@@ -516,6 +523,18 @@ def main() -> None:
     success = 0
     failed = 0
 
+    oom_scales: list[float] = []
+    for raw in str(args.oom_retry_scales).split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            v = float(raw)
+        except ValueError:
+            continue
+        if 0.0 < v < 1.0:
+            oom_scales.append(v)
+
     for input_path in inputs:
         output_path = input_path.with_name(re.sub(r"input\\.wav$", args.output_name, input_path.name))
         if output_path == input_path:
@@ -531,52 +550,96 @@ def main() -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"[RUN] {input_path}")
 
-        try:
-            prompt = build_prompt(input_path, whisper_model, feature_extractor)
-            if args.device.startswith("cuda"):
-                # Prompt extraction can allocate transient CUDA buffers in some backends.
-                torch.cuda.empty_cache()
-            audio_decode_fallback_used = False
-            audio_decode_source = "stream"
-            has_audio_tokens_in_hidden = True
-            hidden_audio_token_count = 0
+        original_max_new_tokens = int(args.max_new_tokens)
+        retry_token_limits = [original_max_new_tokens]
+        for s in oom_scales:
+            scaled = max(64, int(original_max_new_tokens * s))
+            if scaled not in retry_token_limits:
+                retry_token_limits.append(scaled)
 
-            if args.inference_with_steering:
-                steering_map = load_steering_map(input_path.parent, int(args.inject_layer))
-                tts_speech, token_ids, hidden_states = generate_audio(
-                    prompt,
-                    args,
-                    glm_model,
-                    glm_tokenizer,
-                    audio_decoder,
-                    inject_layer=int(args.inject_layer),
-                    steering_map=steering_map,
-                    return_hidden=bool(args.save_hidden),
-                )
-                if args.save_hidden:
+        prompt = None
+        generated_ok = False
+        last_exc: Exception | None = None
+        tts_speech = None
+        token_ids = None
+        hidden_states = None
+        audio_decode_fallback_used = False
+        audio_decode_source = "stream"
+        has_audio_tokens_in_hidden = True
+        hidden_audio_token_count = 0
+
+        for ti, token_limit in enumerate(retry_token_limits, start=1):
+            args.max_new_tokens = token_limit
+            try:
+                if prompt is None:
+                    prompt = build_prompt(input_path, whisper_model, feature_extractor)
+                    if args.device.startswith("cuda"):
+                        # Prompt extraction can allocate transient CUDA buffers in some backends.
+                        torch.cuda.empty_cache()
+
+                if args.inference_with_steering:
+                    steering_map = load_steering_map(input_path.parent, int(args.inject_layer))
+                    tts_speech, token_ids, hidden_states = generate_audio(
+                        prompt,
+                        args,
+                        glm_model,
+                        glm_tokenizer,
+                        audio_decoder,
+                        inject_layer=int(args.inject_layer),
+                        steering_map=steering_map,
+                        return_hidden=bool(args.save_hidden),
+                    )
+                    if args.save_hidden:
+                        audio_decode_source = "hidden_tokens"
+                        hidden_audio_token_count = count_audio_tokens(token_ids, glm_tokenizer)
+                        has_audio_tokens_in_hidden = hidden_audio_token_count > 0
+                elif args.save_hidden:
+                    tts_speech, token_ids, hidden_states = generate_audio(
+                        prompt,
+                        args,
+                        glm_model,
+                        glm_tokenizer,
+                        audio_decoder,
+                        return_hidden=True,
+                    )
                     audio_decode_source = "hidden_tokens"
                     hidden_audio_token_count = count_audio_tokens(token_ids, glm_tokenizer)
                     has_audio_tokens_in_hidden = hidden_audio_token_count > 0
-            elif args.save_hidden:
-                tts_speech, token_ids, hidden_states = generate_audio(
-                    prompt,
-                    args,
-                    glm_model,
-                    glm_tokenizer,
-                    audio_decoder,
-                    return_hidden=True,
-                )
-                audio_decode_source = "hidden_tokens"
-                hidden_audio_token_count = count_audio_tokens(token_ids, glm_tokenizer)
-                has_audio_tokens_in_hidden = hidden_audio_token_count > 0
-            else:
-                tts_speech, token_ids, hidden_states = generate_audio(
-                    prompt,
-                    args,
-                    glm_model,
-                    glm_tokenizer,
-                    audio_decoder,
-                )
+                else:
+                    tts_speech, token_ids, hidden_states = generate_audio(
+                        prompt,
+                        args,
+                        glm_model,
+                        glm_tokenizer,
+                        audio_decoder,
+                    )
+
+                generated_ok = True
+                break
+            except Exception as exc:
+                last_exc = exc
+                is_oom = "out of memory" in str(exc).lower()
+                has_next = ti < len(retry_token_limits)
+                if args.device.startswith("cuda") and is_oom:
+                    torch.cuda.empty_cache()
+                    if has_next:
+                        print(
+                            f"[WARN] CUDA OOM on {input_path.name}: retry {ti}/{len(retry_token_limits)-1} "
+                            f"with max_new_tokens={retry_token_limits[ti]}"
+                        )
+                        continue
+                break
+
+        args.max_new_tokens = original_max_new_tokens
+
+        try:
+            if not generated_ok:
+                if last_exc is None:
+                    raise RuntimeError("generation failed without an exception")
+                raise last_exc
+
+            if tts_speech is None or token_ids is None:
+                raise RuntimeError("generation finished without valid outputs")
 
             torchaudio.save(str(output_path), tts_speech.unsqueeze(0), 22050, format="wav")
 
