@@ -3,7 +3,7 @@
 Plot CE curves for GLM output_hidden.pt files under root_dir/*/.
 
 This is a GLM counterpart of personaplex CE plotting. It reads token ids from
-output_hidden.pt and computes next-token CE with teacher forcing.
+output_hidden.pt and computes per-layer input/output CE.
 """
 
 from __future__ import annotations
@@ -24,11 +24,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--root-dir", required=True, help="Root dir containing <id>/output_hidden.pt")
     ap.add_argument("--model-path", default="THUDM/glm-4-voice-9b", help="GLM model path")
     ap.add_argument("--device", default="cuda", help="Device for CE computation")
+    ap.add_argument("--anchor-span", type=int, default=35, help="Window half-size in tokens for heatmap")
     ap.add_argument(
-        "--anchor-span",
-        type=int,
-        default=50,
-        help="Window half-size in tokens for anchored average CE plots",
+        "--anchor-key",
+        type=str,
+        default="interrupt_start",
+        help="Anchor key in input_timing.json (e.g., interrupt_start or question_start)",
     )
     return ap.parse_args()
 
@@ -49,18 +50,36 @@ def _to_token_ids(raw) -> torch.Tensor:
     return ids
 
 
-def compute_ce_curve(model, token_ids: torch.Tensor, device: str) -> torch.Tensor:
-    if token_ids.numel() < 2:
-        return torch.empty((0,), dtype=torch.float32)
+def _get_lm_head_and_norm(model):
+    lm_head = None
+    if hasattr(model, "get_output_embeddings"):
+        lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        lm_head = getattr(model, "lm_head", None) or getattr(model, "output_layer", None)
+    if lm_head is None:
+        raise RuntimeError("Cannot find output embedding/lm head in model")
 
-    x = token_ids[:-1].to(device).unsqueeze(0)
-    y = token_ids[1:].to(device)
+    norm = None
+    candidates = [
+        ("transformer", "final_layernorm"),
+        ("transformer", "output_layernorm"),
+        ("model", "norm"),
+    ]
+    for parent_name, attr_name in candidates:
+        parent = getattr(model, parent_name, None)
+        if parent is not None and hasattr(parent, attr_name):
+            norm = getattr(parent, attr_name)
+            break
+    return lm_head, norm
 
+
+def _project_logits(hidden: torch.Tensor, lm_head, norm_layer, device: str) -> torch.Tensor:
+    x = hidden.to(device)
+    if norm_layer is not None:
+        x = norm_layer(x)
     with torch.no_grad():
-        out = model(input_ids=x, return_dict=True)
-        logits = out.logits[0].float()
-        ce = F.cross_entropy(logits, y, reduction="none")
-    return ce.detach().cpu()
+        logits = lm_head(x).float()
+    return logits
 
 
 def maybe_get_times(payload: dict, n_points: int) -> List[float]:
@@ -71,15 +90,17 @@ def maybe_get_times(payload: dict, n_points: int) -> List[float]:
     return (torch.arange(n_points, dtype=torch.float32) / frame_rate).tolist()
 
 
-def plot_curve(times: List[float], ce: torch.Tensor, out_png: Path, sample_id: str) -> None:
+def plot_curve(times: List[float], line1: torch.Tensor, line2: torch.Tensor, out_png: Path, sample_id: str, layer: int) -> None:
     import matplotlib.pyplot as plt
 
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    y = ce.numpy()
+    y1 = line1.numpy()
+    y2 = line2.numpy()
 
     fig, ax = plt.subplots(figsize=(10, 3.2), dpi=180)
-    ax.plot(times, y, color="#1f77b4", linewidth=1.2, label="next-token CE")
-    ax.set_title(f"GLM CE Curve ({sample_id})")
+    ax.plot(times, y1, color="#1f77b4", linewidth=1.2, label="input CE (listening)")
+    ax.plot(times, y2, color="#d62728", linewidth=1.2, label="output CE (speaking)")
+    ax.set_title(f"GLM CE Curve ({sample_id}, layer={layer})")
     ax.set_xlabel("Time (seconds)")
     ax.set_ylabel("Cross Entropy")
     ax.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
@@ -103,83 +124,125 @@ def _extract_centered(arr: np.ndarray, center: int, half: int) -> np.ndarray:
     return out
 
 
-def save_anchored_average(
+def save_anchored_heatmaps(
     root_dir: Path,
-    records: List[Dict[str, Any]],
+    per_layer_records: Dict[int, List[Dict[str, Any]]],
     span: int,
+    anchor_key: str,
 ) -> None:
     import matplotlib.pyplot as plt
 
-    anchors = ["question_start", "interrupt_start"]
+    layer_ids = sorted(per_layer_records.keys())
+    if not layer_ids:
+        print("[HEATMAP] no layer records found")
+        return
 
-    for anchor in anchors:
-        windows: List[np.ndarray] = []
+    input_rows: List[np.ndarray] = []
+    output_rows: List[np.ndarray] = []
+    counts: List[int] = []
+    offsets = np.arange(-span, span + 1, dtype=np.int32)
 
-        for rec in records:
+    for lv in layer_ids:
+        in_windows: List[np.ndarray] = []
+        out_windows: List[np.ndarray] = []
+
+        for rec in per_layer_records[lv]:
             timing_path = rec["sample_dir"] / "input_timing.json"
             if not timing_path.is_file():
                 continue
-
             try:
                 timing = json.loads(timing_path.read_text(encoding="utf-8"))
             except Exception:
                 continue
-
-            if not isinstance(timing, dict) or anchor not in timing:
+            if not isinstance(timing, dict) or anchor_key not in timing:
                 continue
 
             try:
-                anchor_sec = float(timing[anchor])
+                anchor_sec = float(timing[anchor_key])
             except Exception:
                 continue
 
             frame_rate = float(rec.get("frame_rate", 12.5))
-            center = int(round(anchor_sec * frame_rate))
-            ce_arr = np.asarray(rec["ce"], dtype=np.float32)
-            if ce_arr.size == 0:
+            line1 = np.asarray(rec["line1"], dtype=np.float32)
+            line2 = np.asarray(rec["line2"], dtype=np.float32)
+            if line1.size == 0 or line2.size == 0:
                 continue
-            center = max(0, min(center, ce_arr.shape[0] - 1))
-            windows.append(_extract_centered(ce_arr, center, span))
 
-        if not windows:
-            print(f"[ANCHOR] no valid samples for anchor={anchor}")
+            center = int(round(anchor_sec * frame_rate))
+            center = max(0, min(center, line1.shape[0] - 1))
+            in_windows.append(_extract_centered(line1, center, span))
+            out_windows.append(_extract_centered(line2, center, span))
+
+        if not in_windows:
+            input_rows.append(np.full((2 * span + 1,), np.nan, dtype=np.float32))
+            output_rows.append(np.full((2 * span + 1,), np.nan, dtype=np.float32))
+            counts.append(0)
             continue
 
-        mat = np.stack(windows, axis=0)
-        mean = np.nanmean(mat, axis=0)
-        count = np.sum(~np.isnan(mat), axis=0).astype(np.int32)
-        std = np.nanstd(mat, axis=0)
-        stderr = std / np.sqrt(np.maximum(count, 1))
+        input_rows.append(np.nanmean(np.stack(in_windows, axis=0), axis=0))
+        output_rows.append(np.nanmean(np.stack(out_windows, axis=0), axis=0))
+        counts.append(len(in_windows))
 
-        offsets = np.arange(-span, span + 1, dtype=np.int32)
-        out_json = root_dir / f"avg_in_out_ce_anchor_{anchor}.json"
-        out_png = root_dir / f"avg_in_out_ce_anchor_{anchor}.png"
+    input_mat = np.stack(input_rows, axis=0).astype(np.float32)
+    output_mat = np.stack(output_rows, axis=0).astype(np.float32)
+
+    def _save_one(mat: np.ndarray, which: str, title: str):
+        out_png = root_dir / f"logit_lens_heatmap_{anchor_key}_{which}.png"
+        out_json = root_dir / f"logit_lens_heatmap_{anchor_key}_{which}.json"
+
+        finite = mat[np.isfinite(mat)]
+        if finite.size == 0:
+            vmin, vmax = 0.0, 1.0
+        else:
+            vmin = float(np.percentile(finite, 5.0))
+            vmax = float(np.percentile(finite, 95.0))
+            if vmax <= vmin:
+                vmax = vmin + 1e-6
 
         payload = {
-            "anchor": anchor,
-            "span_tokens": int(span),
-            "num_samples": int(len(windows)),
+            "anchor": anchor_key,
+            "which": which,
+            "layer_ids": layer_ids,
             "offset_tokens": offsets.tolist(),
-            "mean_ce": np.nan_to_num(mean, nan=0.0).tolist(),
-            "stderr_ce": np.nan_to_num(stderr, nan=0.0).tolist(),
-            "count_per_offset": count.tolist(),
+            "heatmap": np.nan_to_num(mat, nan=0.0).tolist(),
+            "num_samples_per_layer": counts,
+            "vmin": vmin,
+            "vmax": vmax,
         }
         out_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        x = offsets.astype(np.float32) / 12.5
-        fig, ax = plt.subplots(figsize=(8.6, 3.4), dpi=180)
-        ax.plot(x, mean, color="#1f77b4", linewidth=1.4, label=f"mean CE ({anchor})")
-        ax.fill_between(x, mean - stderr, mean + stderr, color="#1f77b4", alpha=0.18, linewidth=0)
-        ax.axvline(0.0, color="#333333", linestyle="--", linewidth=1.0)
-        ax.set_title(f"Average CE around {anchor} (n={len(windows)})")
-        ax.set_xlabel("Offset from anchor (seconds)")
-        ax.set_ylabel("Cross Entropy")
-        ax.grid(True, axis="x", linestyle=":", linewidth=0.7, alpha=0.65)
-        ax.legend(loc="upper right", fontsize=8)
+        fig, ax = plt.subplots(figsize=(10.0, 5.4), dpi=180)
+        img = ax.imshow(
+            mat,
+            aspect="auto",
+            interpolation="nearest",
+            origin="lower",
+            cmap="coolwarm",
+            vmin=vmin,
+            vmax=vmax,
+            extent=(float(offsets[0]), float(offsets[-1]), float(layer_ids[0]) - 0.5, float(layer_ids[-1]) + 0.5),
+        )
+        cbar = fig.colorbar(img, ax=ax)
+        cbar.set_label("CE")
+        ax.set_title(title)
+        ax.set_xlabel(f"Relative token index to {anchor_key}")
+        ax.set_ylabel("Layer")
+        ax.set_yticks(layer_ids)
         fig.tight_layout()
         fig.savefig(out_png, bbox_inches="tight")
         plt.close(fig)
-        print(f"[ANCHOR] saved {out_json} + {out_png}")
+        print(f"[HEATMAP] saved {out_json} + {out_png}")
+
+    _save_one(
+        input_mat,
+        which="input_ce",
+        title=f"Input CE Heatmap (listening) | anchor={anchor_key}",
+    )
+    _save_one(
+        output_mat,
+        which="output_ce",
+        title=f"Output CE Heatmap (speaking) | anchor={anchor_key}",
+    )
 
 
 def main() -> None:
@@ -195,10 +258,11 @@ def main() -> None:
 
     print("[INIT] loading GLM model for CE plotting...")
     model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True, device_map={"": 0}).eval()
+    lm_head, norm_layer = _get_lm_head_and_norm(model)
 
     ok = 0
     total = 0
-    records: List[Dict[str, Any]] = []
+    per_layer_records: Dict[int, List[Dict[str, Any]]] = {}
     for hp in paths:
         total += 1
         try:
@@ -208,46 +272,107 @@ def main() -> None:
             if "token_ids" not in payload:
                 raise KeyError("Missing key 'token_ids' in output_hidden.pt")
 
+            if "text_hidden_layers" not in payload:
+                raise KeyError("Missing key 'text_hidden_layers' in output_hidden.pt")
+
+            hidden = payload["text_hidden_layers"]
+            if not isinstance(hidden, torch.Tensor) or hidden.ndim != 3:
+                raise ValueError(f"Expected text_hidden_layers [T,L,D], got {type(hidden).__name__} {getattr(hidden, 'shape', None)}")
+
             token_ids = _to_token_ids(payload["token_ids"])
-            ce = compute_ce_curve(model, token_ids, args.device)
-            if ce.numel() == 0:
+            if token_ids.numel() < 3:
                 print(f"[SKIP] {hp} (too few tokens)")
                 continue
 
-            times = maybe_get_times(payload, int(ce.numel()))
-            out_json = hp.with_name("in_out_ce_0.json")
-            out_png = hp.with_name("logit_lens_ce_layer_0.png")
+            if "input_token_ids" in payload:
+                in_ids = payload["input_token_ids"]
+                if isinstance(in_ids, torch.Tensor) and in_ids.ndim == 2 and in_ids.shape[1] >= 1:
+                    input_targets = in_ids[:, 0].long().view(-1)
+                else:
+                    input_targets = torch.full_like(token_ids, fill_value=-1)
+                    input_targets[1:] = token_ids[:-1]
+            else:
+                input_targets = torch.full_like(token_ids, fill_value=-1)
+                input_targets[1:] = token_ids[:-1]
 
-            compat = {
-                "line1_user_multimodal_ce": ce.tolist(),
-                "line2_model_multimodal_ce": ce.tolist(),
-                "ratio_line1_over_line2": [1.0] * int(ce.numel()),
-                "line1_shift": "n_to_n_plus_1",
-                "line2_shift": "n_to_n_plus_1",
-                "moving_average_window": 1,
-                "smoothing": "none",
-                "layer": 0,
-                "num_points": int(ce.numel()),
-                "glm_note": "Both line1/line2 are mapped to GLM next-token CE for compatibility.",
-            }
-            with out_json.open("w", encoding="utf-8") as f:
-                json.dump(compat, f, indent=2, ensure_ascii=False)
+            if "output_token_ids" in payload:
+                out_ids = payload["output_token_ids"]
+                if isinstance(out_ids, torch.Tensor) and out_ids.ndim == 2 and out_ids.shape[1] >= 1:
+                    output_targets = out_ids[:, 0].long().view(-1)
+                else:
+                    output_targets = token_ids
+            else:
+                output_targets = token_ids
 
-            plot_curve(times, ce, out_png, hp.parent.name)
-            records.append(
-                {
-                    "sample_dir": hp.parent,
-                    "ce": ce.tolist(),
-                    "frame_rate": float(payload.get("frame_rate", 12.5)),
+            t, num_layers, _ = hidden.shape
+            for lv in range(num_layers):
+                h = hidden[:, lv, :]
+                logits = _project_logits(h, lm_head=lm_head, norm_layer=norm_layer, device=args.device)
+
+                # personaplex-like mapping:
+                # line1: input CE (listening), shifted n->n+1 target
+                # line2: output CE (speaking), aligned n target
+                line1 = F.cross_entropy(
+                    logits[:-1],
+                    input_targets[1:].to(args.device),
+                    reduction="none",
+                    ignore_index=-1,
+                ).detach().cpu()
+                line2 = F.cross_entropy(
+                    logits[:-1],
+                    output_targets[:-1].to(args.device),
+                    reduction="none",
+                    ignore_index=-1,
+                ).detach().cpu()
+
+                n = int(min(line1.numel(), line2.numel()))
+                line1 = line1[:n]
+                line2 = line2[:n]
+                if n == 0:
+                    continue
+
+                times = maybe_get_times(payload, n)
+                ratio = (line1 / line2.clamp_min(1e-6)).tolist()
+
+                out_json = hp.with_name(f"in_out_ce_{lv}.json")
+                out_png = hp.with_name(f"logit_lens_ce_layer_{lv}.png")
+                compat = {
+                    "line1_user_multimodal_ce": line1.tolist(),
+                    "line2_model_multimodal_ce": line2.tolist(),
+                    "ratio_line1_over_line2": ratio,
+                    "line1_shift": "n_to_n_plus_1",
+                    "line2_shift": "n_to_n",
+                    "moving_average_window": 1,
+                    "smoothing": "none",
+                    "layer": int(lv),
+                    "num_points": int(n),
+                    "glm_note": "line1=input CE(listening), line2=output CE(speaking)",
                 }
-            )
-            print(f"[OK] {out_json} + {out_png}")
+                with out_json.open("w", encoding="utf-8") as f:
+                    json.dump(compat, f, indent=2, ensure_ascii=False)
+
+                plot_curve(times, line1, line2, out_png, hp.parent.name, lv)
+                per_layer_records.setdefault(int(lv), []).append(
+                    {
+                        "sample_dir": hp.parent,
+                        "line1": line1.tolist(),
+                        "line2": line2.tolist(),
+                        "frame_rate": float(payload.get("frame_rate", 12.5)),
+                    }
+                )
+
+            print(f"[OK] {hp.parent}")
             ok += 1
         except Exception as exc:
             print(f"[SKIP] {hp}: {exc}")
 
-    if records:
-        save_anchored_average(Path(args.root_dir).expanduser(), records, span=int(args.anchor_span))
+    if per_layer_records:
+        save_anchored_heatmaps(
+            root_dir=Path(args.root_dir).expanduser(),
+            per_layer_records=per_layer_records,
+            span=int(args.anchor_span),
+            anchor_key=str(args.anchor_key),
+        )
 
     print(f"[DONE] generated {ok}/{total}")
 
