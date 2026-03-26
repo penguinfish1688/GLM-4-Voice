@@ -29,6 +29,31 @@ from speech_tokenizer.utils import extract_speech_token
 AUDIO_TOKEN_RE = re.compile(r"<\|audio_(\d+)\|>")
 
 
+def _get_audio_offset_id(glm_tokenizer: Any) -> int:
+    audio_offset = int(glm_tokenizer.convert_tokens_to_ids("<|audio_0|>"))
+    if audio_offset < 0:
+        raise RuntimeError("Tokenizer does not contain <|audio_0|> token")
+    return audio_offset
+
+
+def _extract_audio_tokens_from_ids(token_ids: List[int], glm_tokenizer: Any) -> List[int]:
+    audio_offset = _get_audio_offset_id(glm_tokenizer)
+    audio_tokens: List[int] = []
+    token_names = glm_tokenizer.convert_ids_to_tokens(token_ids)
+    for token_id, tok in zip(token_ids, token_names):
+        if tok == "<|user|>":
+            break
+        if int(token_id) >= audio_offset:
+            # Official path uses token_id >= audio_offset.
+            audio_tokens.append(int(token_id) - audio_offset)
+            continue
+        # Fallback to token string parsing for compatibility.
+        m = AUDIO_TOKEN_RE.fullmatch(str(tok))
+        if m is not None:
+            audio_tokens.append(int(m.group(1)))
+    return audio_tokens
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("glm4voice_rootdir_inference_local")
     parser.add_argument("--root-dir", required=True, help="Dataset root containing */input.wav")
@@ -98,6 +123,14 @@ def build_prompt(audio_path: Path, whisper_model: WhisperVQEncoder, feature_extr
         raise RuntimeError(f"No audio tokens extracted from: {audio_path}")
     token_str = "".join([f"<|audio_{x}|>" for x in audio_tokens])
     return "<|begin_of_audio|>" + token_str + "<|end_of_audio|>"
+
+
+def build_model_input_prompt(user_audio_prompt: str, system_prompt: str) -> str:
+    # Match official inference template used in web_demo -> model_server path.
+    return (
+        f"<|system|>\n{system_prompt}"
+        f"<|user|>\n{user_audio_prompt}<|assistant|>streaming_transcription\n"
+    )
 
 
 def _sample_top_p(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
@@ -294,14 +327,7 @@ def decode_audio_from_token_ids(
     audio_decoder: AudioDecoder,
     device: str,
 ) -> torch.Tensor:
-    audio_tokens: List[int] = []
-    token_names = glm_tokenizer.convert_ids_to_tokens(token_ids)
-    for tok in token_names:
-        if tok == "<|user|>":
-            break
-        m = AUDIO_TOKEN_RE.fullmatch(str(tok))
-        if m is not None:
-            audio_tokens.append(int(m.group(1)))
+    audio_tokens = _extract_audio_tokens_from_ids(token_ids, glm_tokenizer)
 
     if not audio_tokens:
         raise RuntimeError("No audio tokens returned from model")
@@ -351,24 +377,19 @@ def generate_audio(
 
 
 def count_audio_tokens(token_ids: List[int], glm_tokenizer: Any) -> int:
-    n = 0
-    token_names = glm_tokenizer.convert_ids_to_tokens(token_ids)
-    for tok in token_names:
-        if tok == "<|user|>":
-            break
-        if AUDIO_TOKEN_RE.fullmatch(str(tok)) is not None:
-            n += 1
-    return int(n)
+    return int(len(_extract_audio_tokens_from_ids(token_ids, glm_tokenizer)))
 
 
 def build_audio_token_mask(token_ids: List[int], glm_tokenizer: Any) -> List[bool]:
+    audio_offset = _get_audio_offset_id(glm_tokenizer)
     token_names = glm_tokenizer.convert_ids_to_tokens(token_ids)
     mask: List[bool] = []
-    for tok in token_names:
+    for token_id, tok in zip(token_ids, token_names):
         if tok == "<|user|>":
             mask.append(False)
             break
-        mask.append(AUDIO_TOKEN_RE.fullmatch(str(tok)) is not None)
+        is_audio = int(token_id) >= audio_offset or (AUDIO_TOKEN_RE.fullmatch(str(tok)) is not None)
+        mask.append(is_audio)
     if len(mask) < len(token_ids):
         mask.extend([False] * (len(token_ids) - len(mask)))
     return mask
@@ -572,7 +593,8 @@ def main() -> None:
             args.max_new_tokens = token_limit
             try:
                 if prompt is None:
-                    prompt = build_prompt(input_path, whisper_model, feature_extractor)
+                    user_audio_prompt = build_prompt(input_path, whisper_model, feature_extractor)
+                    prompt = build_model_input_prompt(user_audio_prompt, args.system_prompt)
                     if args.device.startswith("cuda"):
                         # Prompt extraction can allocate transient CUDA buffers in some backends.
                         torch.cuda.empty_cache()
