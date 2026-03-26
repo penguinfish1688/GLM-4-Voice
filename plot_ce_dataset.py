@@ -128,13 +128,28 @@ def _get_lm_head_and_norm(model):
 
 
 def _project_logits(hidden: torch.Tensor, lm_head, norm_layer, device: str) -> torch.Tensor:
-    x = hidden.to(device)
+    target_dtype = None
+    if hasattr(lm_head, "weight") and isinstance(getattr(lm_head, "weight"), torch.Tensor):
+        target_dtype = lm_head.weight.dtype
+    elif norm_layer is not None:
+        try:
+            target_dtype = next(norm_layer.parameters()).dtype
+        except StopIteration:
+            target_dtype = None
+
+    if target_dtype is None:
+        target_dtype = torch.float32
+
+    x = hidden.to(device=device, dtype=target_dtype)
     if norm_layer is not None:
         x = norm_layer(x)
     with torch.no_grad():
         # Module-style output head.
         if callable(lm_head):
-            logits = lm_head(x).float()
+            out = lm_head(x)
+            if not isinstance(out, torch.Tensor):
+                raise RuntimeError("lm head returned non-tensor output")
+            logits = out.float()
         # Embedding fallback (tied weights): logits = x @ W^T
         elif hasattr(lm_head, "weight"):
             logits = F.linear(x, lm_head.weight).float()
