@@ -358,7 +358,7 @@ def _run_local_generation(
     return generated, hidden_states
 
 
-def _run_generate_fallback(
+def _run_generate_streamer(
     prompt: str,
     args: argparse.Namespace,
     glm_model: Any,
@@ -419,7 +419,7 @@ def _run_generate_fallback(
 
     try:
         with torch.inference_mode():
-            # Mirror model_server.generate_stream behavior for fallback.
+            # Mirror model_server.generate_stream behavior as the primary path.
             streamer = TokenStreamer(skip_prompt=True, timeout=120)
             thread = Thread(
                 target=glm_model.generate,
@@ -499,33 +499,8 @@ def generate_audio(
     steering_map: dict[str, list[float] | None] | None = None,
     return_hidden: bool = False,
 ) -> tuple[torch.Tensor, List[int], torch.Tensor | None]:
-    attempts = max(1, int(args.hidden_retries)) if (return_hidden or steering_map is not None) else 1
-    last_exc: Exception | None = None
-
-    for attempt in range(1, attempts + 1):
-        token_ids, hidden_states = _run_local_generation(
-            prompt=prompt,
-            args=args,
-            glm_model=glm_model,
-            glm_tokenizer=glm_tokenizer,
-            return_hidden=return_hidden,
-            steering_map=steering_map,
-            inject_layer=inject_layer,
-        )
-        try:
-            tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
-            return tts_speech, token_ids, hidden_states
-        except RuntimeError as ex:
-            if "No audio tokens returned from model" not in str(ex):
-                raise
-            last_exc = ex
-            if attempt < attempts:
-                print(f"[WARN] generation produced no audio tokens (attempt {attempt}/{attempts}), retrying...")
-                continue
-            print("[WARN] step-wise generation exhausted, switching to official model.generate fallback...")
-
-    # Final fallback: match official generation behavior from model_server/web_demo path.
-    token_ids, hidden_states = _run_generate_fallback(
+    # Use the server-equivalent streamer path as the primary route.
+    token_ids, hidden_states = _run_generate_streamer(
         prompt=prompt,
         args=args,
         glm_model=glm_model,
@@ -534,14 +509,7 @@ def generate_audio(
         steering_map=steering_map,
         inject_layer=inject_layer,
     )
-    try:
-        tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
-    except RuntimeError as ex:
-        if "No audio tokens returned from model" in str(ex):
-            raise RuntimeError(
-                f"No audio tokens returned from model after {attempts} step-wise attempts and model.generate fallback"
-            ) from ex
-        raise
+    tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
     return tts_speech, token_ids, hidden_states
 
 
@@ -853,13 +821,13 @@ def main() -> None:
                 if args.inference_with_steering:
                     print(
                         f"[OK] {output_path} + {hidden_path} hidden_shape={hs} "
-                        f"audio_in_hidden={hidden_audio_token_count} fallback={audio_decode_fallback_used} "
+                        f"audio_in_hidden={hidden_audio_token_count} "
                         f"(steered layer={int(args.inject_layer)})"
                     )
                 else:
                     print(
                         f"[OK] {output_path} + {hidden_path} hidden_shape={hs} "
-                        f"audio_in_hidden={hidden_audio_token_count} fallback={audio_decode_fallback_used}"
+                        f"audio_in_hidden={hidden_audio_token_count}"
                     )
             else:
                 if args.inference_with_steering:
