@@ -12,13 +12,15 @@ python model_server.py --host localhost --model-path THUDM/glm-4-voice-9b --port
 """
 import argparse
 import json
+import base64
 
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 from transformers.generation.streamers import BaseStreamer
 import torch
 import uvicorn
+import numpy as np
 
 from threading import Thread
 from queue import Queue
@@ -118,6 +120,62 @@ class ModelWorker:
             }
             yield (json.dumps(ret) + "\n").encode()
 
+    @torch.inference_mode()
+    def generate_with_hidden(self, params):
+        tokenizer, model = self.glm_tokenizer, self.glm_model
+
+        prompt = params["prompt"]
+        temperature = float(params.get("temperature", 1.0))
+        top_p = float(params.get("top_p", 1.0))
+        max_new_tokens = int(params.get("max_new_tokens", 256))
+
+        inputs = tokenizer([prompt], return_tensors="pt")
+        inputs = inputs.to(self.device)
+        prompt_len = int(inputs["input_ids"].shape[1])
+
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=True,
+            return_dict_in_generate=True,
+        )
+
+        sequences = output.sequences
+        full_ids = sequences[0]
+        generated_ids = full_ids[prompt_len:]
+
+        forward_out = model(
+            input_ids=sequences,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        last_hidden = forward_out.hidden_states[-1][0, prompt_len:, :]
+        hidden_np = last_hidden.detach().cpu().to(torch.float16).numpy()
+
+        return {
+            "token_ids": generated_ids.detach().cpu().tolist(),
+            "hidden_dtype": "float16",
+            "hidden_shape": list(hidden_np.shape),
+            "hidden_b64": base64.b64encode(hidden_np.tobytes()).decode("ascii"),
+            "error_code": 0,
+        }
+
+    def generate_with_hidden_gate(self, params):
+        try:
+            return self.generate_with_hidden(params)
+        except Exception as e:
+            print("Caught Unknown Error", e)
+            return {
+                "token_ids": [],
+                "hidden_dtype": "float16",
+                "hidden_shape": [0, 0],
+                "hidden_b64": "",
+                "error_code": 1,
+                "text": "Server Error",
+            }
+
 
 app = FastAPI()
 
@@ -128,6 +186,13 @@ async def generate_stream(request: Request):
 
     generator = worker.generate_stream_gate(params)
     return StreamingResponse(generator)
+
+
+@app.post("/generate_with_hidden")
+async def generate_with_hidden(request: Request):
+    params = await request.json()
+    payload = worker.generate_with_hidden_gate(params)
+    return JSONResponse(payload)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ for streamed token generation.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -34,12 +35,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix", default="", help="Input/output filename prefix. Example: clean_")
     parser.add_argument("--input-name", default="input.wav", help="Input wav filename")
     parser.add_argument("--output-name", default="output.wav", help="Output wav filename")
+    parser.add_argument("--hidden-name", default="output_hidden.pt", help="Hidden payload filename")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output wav")
+    parser.add_argument("--save-hidden", action="store_true", help="Save hidden payload next to output wav")
 
     parser.add_argument("--model-path", default="THUDM/glm-4-voice-9b", help="GLM model path")
     parser.add_argument("--tokenizer-path", default="THUDM/glm-4-voice-tokenizer", help="Speech tokenizer path")
     parser.add_argument("--flow-path", default="./glm-4-voice-decoder", help="Decoder checkpoint directory")
     parser.add_argument("--server-url", default="http://localhost:10000/generate_stream", help="Model server endpoint")
+    parser.add_argument(
+        "--server-hidden-url",
+        default="http://localhost:10000/generate_with_hidden",
+        help="Model server endpoint returning token ids and hidden states",
+    )
 
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.8)
@@ -156,6 +164,95 @@ def generate_audio(
         return torch.cat(tts_speechs, dim=-1).cpu()
 
 
+def generate_tokens_and_hidden(prompt: str, args: argparse.Namespace) -> tuple[List[int], torch.Tensor]:
+    inputs = f"<|system|>\n{args.system_prompt}<|user|>\n{prompt}<|assistant|>streaming_transcription\n"
+    response = requests.post(
+        args.server_hidden_url,
+        json={
+            "prompt": inputs,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_new_tokens": args.max_new_tokens,
+        },
+        timeout=600,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    if int(payload.get("error_code", 1)) != 0:
+        raise RuntimeError(f"generate_with_hidden failed: {payload}")
+
+    token_ids = payload.get("token_ids", [])
+    if not isinstance(token_ids, list):
+        raise RuntimeError("Invalid response: token_ids is not a list")
+
+    hidden_shape = payload.get("hidden_shape", [0, 0])
+    if not isinstance(hidden_shape, list) or len(hidden_shape) != 2:
+        raise RuntimeError("Invalid response: hidden_shape")
+
+    hidden_b64 = payload.get("hidden_b64", "")
+    raw = base64.b64decode(hidden_b64) if hidden_b64 else b""
+
+    if hidden_shape[0] == 0:
+        hidden_states = torch.empty((0, 0), dtype=torch.float16)
+    else:
+        hidden_np = torch.frombuffer(raw, dtype=torch.float16).clone().reshape(hidden_shape[0], hidden_shape[1])
+        hidden_states = hidden_np
+
+    return [int(x) for x in token_ids], hidden_states
+
+
+def decode_audio_from_token_ids(
+    token_ids: List[int],
+    glm_tokenizer: Any,
+    audio_decoder: AudioDecoder,
+    device: str,
+) -> torch.Tensor:
+    audio_offset = int(glm_tokenizer.convert_tokens_to_ids("<|audio_0|>"))
+    end_token_id = int(glm_tokenizer.convert_tokens_to_ids("<|user|>"))
+
+    audio_tokens: List[int] = []
+    for token_id in token_ids:
+        if token_id == end_token_id:
+            break
+        if token_id >= audio_offset:
+            audio_tokens.append(int(token_id - audio_offset))
+
+    if not audio_tokens:
+        raise RuntimeError("No audio tokens returned from model")
+
+    token_tensor = torch.tensor(audio_tokens, dtype=torch.int64, device=device).unsqueeze(0)
+    return audio_decoder.offline_inference(token_tensor).squeeze(0).cpu()
+
+
+def save_hidden_payload(
+    hidden_path: Path,
+    input_path: Path,
+    output_path: Path,
+    token_ids: List[int],
+    hidden_states: torch.Tensor,
+    glm_tokenizer: Any,
+) -> None:
+    t = int(hidden_states.shape[0])
+    frame_rate_hz = 12.5
+    times = torch.arange(t, dtype=torch.float32) / frame_rate_hz
+    token_time_ranges = torch.stack([times, times + (1.0 / frame_rate_hz)], dim=1) if t > 0 else torch.empty((0, 2))
+
+    payload = {
+        "schema_version": 1,
+        "input_wav": str(input_path),
+        "output_wav": str(output_path),
+        "frame_rate": float(frame_rate_hz),
+        "token_ids": torch.tensor(token_ids, dtype=torch.long),
+        "token_names": glm_tokenizer.convert_ids_to_tokens(token_ids),
+        "times": times,
+        "token_time_ranges_sec": token_time_ranges,
+        "hidden_states": hidden_states.float().cpu(),
+        "text_hidden_layers": hidden_states.float().cpu().unsqueeze(1),
+    }
+    torch.save(payload, hidden_path)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -189,8 +286,11 @@ def main() -> None:
         output_path = input_path.with_name(re.sub(r"input\\.wav$", args.output_name, input_path.name))
         if output_path == input_path:
             output_path = input_path.with_name(f"{args.prefix}{args.output_name}")
+        hidden_path = output_path.with_name(output_path.stem + "_hidden.pt")
+        if args.hidden_name != "output_hidden.pt":
+            hidden_path = output_path.with_name(args.hidden_name)
 
-        if output_path.exists() and not args.overwrite:
+        if output_path.exists() and (not args.save_hidden or hidden_path.exists()) and not args.overwrite:
             print(f"[SKIP] {output_path}")
             continue
 
@@ -199,9 +299,25 @@ def main() -> None:
 
         try:
             prompt = build_prompt(input_path, whisper_model, feature_extractor)
-            tts_speech = generate_audio(prompt, args, glm_tokenizer, audio_decoder)
+            if args.save_hidden:
+                token_ids, hidden_states = generate_tokens_and_hidden(prompt, args)
+                tts_speech = decode_audio_from_token_ids(token_ids, glm_tokenizer, audio_decoder, args.device)
+            else:
+                tts_speech = generate_audio(prompt, args, glm_tokenizer, audio_decoder)
             torchaudio.save(str(output_path), tts_speech.unsqueeze(0), 22050, format="wav")
-            print(f"[OK] {output_path}")
+
+            if args.save_hidden:
+                save_hidden_payload(
+                    hidden_path=hidden_path,
+                    input_path=input_path,
+                    output_path=output_path,
+                    token_ids=token_ids,
+                    hidden_states=hidden_states,
+                    glm_tokenizer=glm_tokenizer,
+                )
+                print(f"[OK] {output_path} + {hidden_path}")
+            else:
+                print(f"[OK] {output_path}")
             success += 1
         except Exception as exc:
             print(f"[FAIL] {input_path}: {exc}")
